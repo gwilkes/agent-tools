@@ -1,4 +1,5 @@
-"""The tools an agent reaches for in a shell, without the shell, served over MCP.
+"""Tools for working in a project, served over MCP: files, search, git and the
+project's own scripts.
 
     gci mcp                   serve the tools over stdio (what .mcp.json runs)
     gci scripts               list the scripts and hosts .gci/settings.json defines
@@ -16,16 +17,12 @@
 `gci` is the console script `pip install` makes; `python -m gci` is the same
 thing from a checkout.
 
-A project that denies Bash still needs to edit files, search them, move them
-and run its build. Each of those is a tool here with a fixed shape, so what
-an agent can do is the tool list rather than whatever a shell line can say:
+Each tool has a fixed shape, so what an agent can do is the tool list:
 
-    read write edit sub grep ls move rename delete mkdir diff (tools/files.py)
-    clean_tmp                                                 (tools/files.py)
-    json                                                      (tools/data.py)
-    git_status git_diff git_log git_show git_blame git_branch (tools/git.py)
-    run_script sync hosts kill                                (tools/run.py)
-    self_test restart list_tools                              (mcp.py)
+    read edit sub clean_tmp                       (tools/files.py)
+    json                                          (tools/data.py)
+    list_scripts run_script job sync hosts kill   (tools/run.py)
+    self_test restart list_tools                  (mcp.py)
 
 The bulk forms sit inside two of those rather than beside them, to keep the
 tool list short. `edit` takes several files at once, all or nothing, and
@@ -36,10 +33,9 @@ applied in order, or a `words` map renaming whole words in one pass.
 
 There is deliberately no tool that runs arbitrary code. What an agent would
 otherwise write a throwaway script for gets a tool of its own instead: `json`
-for querying and editing JSON (jq), `rename` for renaming by pattern (a loop
-of mv), `read` with a negative offset for the end of a log (tail), `sub` for
-editing across files (sed). Anything else that needs a process is a script in
-the settings, where a person wrote it.
+for querying and editing JSON, `read` with a negative offset for the end of a
+log, `sub` for editing across files. Anything
+else that needs a process is a script in the settings, where a person wrote it.
 
 The root is the directory the server starts in (Claude Code starts a project's
 servers in the project), or GCI_ROOT if set. Every path a tool takes is
@@ -62,10 +58,11 @@ on every call, so an edit to it lands without a restart:
         "remote":  {...}
     }
 
-`deny` is what no tool reads, writes, lists or syncs. Claude Code's own
-`Read(...)` deny rules govern only its built-in Read tool; a server reading the
-file is a different process, so the same globs have to be repeated here to
-hold. `protect` is what tools may read but never change. .gci/, .mcp.json,
+`deny` is what no tool here reads, writes or syncs. It is not a sandbox: the
+client's own tools and shell answer to the client's permissions, so a file
+that must stay unread needs the same globs there too (in Claude Code, `Read`
+and `Edit` deny rules). Here they also keep secrets off every host a sync
+reaches. `protect` is what tools may read but never change. .gci/, .mcp.json,
 .claude/, every .git/ and this package (when it lives in the tree) are always
 protected: a tool that can rewrite the script table can run anything, one
 that can rewrite the permissions can grant itself the rest, and git's hooks
@@ -74,19 +71,12 @@ package, `"edit_self": true` lifts the protection from the package itself.
 `skip` names directories (and files) a recursive walk does not enter -- a path
 that names one directly still works.
 
-The git tools only read: nothing stages, commits, switches branches, fetches
-or pushes. Even so, each call turns off every way read-only git can run code
-(fsmonitor, hooks, external diff, textconv, the pager, index writes), refuses
-a ref that could be an option or a `REV:path` read, and keeps denied files
-out of every diff, log and show, tracked or not.
-
 A glob without a `/` matches a name at any depth (`.env`), one with a `/`
 matches the root-relative path (`secrets/**`, everything under secrets/).
 
-A script is an argv, never a shell line: `command` is run as given, with the
-caller's `args` appended only when the entry says `"args": true`. That is what
-keeps run_script from being Bash by another name. A script that wants a shell
-says so in the settings (`["sh", "-c", "..."]`), where a person wrote it. Output
+A script is an argv: `command` is run as given, with the caller's `args`
+appended only when the entry says `"args": true`, so run_script runs only the
+commands a person wrote. A script that wants a shell says so in the settings (`["sh", "-c", "..."]`), where a person wrote it. Output
 is stdout and stderr together; a run past its `timeout` (600 s unless the
 entry says otherwise) is killed with its whole process tree.
 
@@ -179,5 +169,5 @@ server's own package directory; that is /self-update's alone.
 
 Text is read and written as UTF-8 bytes, so line endings and a missing final
 newline survive an edit. A file with a NUL in its first 8 KiB, or that is not
-UTF-8, is binary: grep and sub pass over it and read says what it is.
+UTF-8, is binary: sub passes over it and read says what it is.
 """

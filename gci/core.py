@@ -175,7 +175,7 @@ def resolve(path, rules, write=False):
         raise ToolError(f"outside the project root ({ROOT}): {path}")
     rel = rel_of(target)
     if rules.denied(rel):
-        raise ToolError(f"denied by {CONFIG}: {rel}")
+        raise ToolError(f"denied, off limits to tools: {rel}")
     if write and rules.protected(rel):
         raise ToolError(f"protected, read-only to tools: {rel}")
     return target
@@ -222,11 +222,55 @@ def write_text(path, text):
     path.write_bytes(text.encode("utf-8"))
 
 
-def clip(text, limit=MAX_OUTPUT):
+def clip(text, limit=MAX_OUTPUT, hint=None):
     if len(text) <= limit:
         return text
     half = limit // 2
-    return f"{text[:half]}\n... {len(text) - limit} characters cut ...\n{text[-half:]}"
+    more = f"; {hint}" if hint else ""
+    return (
+        f"{text[:half]}\n... {len(text) - limit} characters cut{more} ...\n"
+        f"{text[-half:]}"
+    )
+
+
+def filter_lines(lines, grep=None, tail=None, pinned=None):
+    """`lines` as `| grep -E GREP | tail -n TAIL` would leave them. Returns
+    (lines, note), the note saying what was dropped, or None if nothing was.
+
+    A line `pinned(line)` holds is kept wherever it is and counts toward
+    neither, so a run's `log:` pointer outlives any filter.
+    """
+    tail = check_tail(tail)
+    rx = compile_pattern(grep) if grep is not None else None
+    pin = pinned or (lambda _line: False)
+    body = [i for i, line in enumerate(lines) if not pin(line)]
+    keep = [i for i in body if rx is None or rx.search(lines[i])]
+    matched = len(keep)
+    if tail is not None:
+        keep = keep[-tail:]
+    kept = set(keep)
+    out = [line for i, line in enumerate(lines) if i in kept or pin(line)]
+    parts = []
+    if rx is not None:
+        parts.append(f"grep `{grep}`: {matched} of {len(body)} line(s) match")
+    if len(keep) < matched:
+        parts.append(f"the last {len(keep)} of {matched} shown")
+    return out, f"[{'; '.join(parts)}]" if parts else None
+
+
+def check_tail(tail):
+    """`tail` as a count of lines, or None; a ToolError for anything else."""
+    if tail is None:
+        return None
+    if isinstance(tail, bool) or not isinstance(tail, int) or tail < 1:
+        raise ToolError(f"tail must be a positive integer, not {tail!r}")
+    return tail
+
+
+def filter_text(text, grep=None, tail=None):
+    """`text` through filter_lines, with its note on a line of its own first."""
+    lines, note = filter_lines(text.splitlines(), grep, tail)
+    return text if note is None else "\n".join([note, *lines])
 
 
 def output_limit(cfg):
@@ -266,7 +310,11 @@ def clip_lines(lines, limit, see=None):
         used += len(line) + 1
     tail.reverse()
     cut = len(lines) - len(head) - len(tail)
-    where = f"; the full output is in `{see}`" if see else ""
+    where = (
+        f"; the full output is in `{see}` (grep it, or read it with a negative offset)"
+        if see
+        else ""
+    )
     return "\n".join(
         [*head, f"... output truncated: {cut} line(s) cut{where} ...", *tail]
     )
@@ -337,7 +385,7 @@ def describe_script(entry):
 def describe_scripts(cfg):
     scripts = cfg.get("scripts") or {}
     if not scripts:
-        return f'  (none; add them under "scripts" in {CONFIG})'
+        return "  (none)"
     rows = []
     for name, entry in sorted(scripts.items()):
         desc = entry.get("description") if isinstance(entry, dict) else ""
@@ -363,7 +411,7 @@ def host_map(cfg):
 def describe_hosts(cfg):
     hosts = host_map(cfg)
     if not hosts:
-        return f'  (none; add them under "remote": {{"hosts": {{...}}}} in {CONFIG})'
+        return "  (none)"
     rows = [f"  {name}: {addr}" for name, addr in hosts.items()]
     proxy = remote_cfg(cfg).get("proxy")
     if proxy:

@@ -1,9 +1,10 @@
-"""Reading, editing, searching and moving files: the part of a shell an agent
-uses most, each with the root and the deny/protect lists enforced."""
+"""Reading and editing files, and emptying the scratch directory, each with
+the root and the deny/protect lists enforced."""
 
-import difflib
+import os
 import re
 import shutil
+import subprocess
 
 from .. import core
 from ..core import (
@@ -11,6 +12,7 @@ from ..core import (
     MAX_LINE,
     Rules,
     ToolError,
+    check_tail,
     compile_pattern,
     config,
     human,
@@ -22,20 +24,25 @@ from ..core import (
     walk,
     write_text,
 )
-from . import GLOB, PATH, tool
+from . import FILE, GLOB, PATH, tool
 
 
 @tool(
     """
     Read a text file, numbered like `cat -n`. Long files come a page at a time:
     the header says which lines these are and the offset for the next page. A
-    negative offset counts from the end, like tail: -50 is the last 50 lines.
+    negative offset counts from the end: -50 is the last 50 lines, as is
+    `tail` 50. To see only the lines matching a pattern, with these same line
+    numbers, search it with `grep -n` instead.
     """,
-    path=PATH,
+    path=FILE,
     offset=("integer", "First line to show, 1-based; negative counts from the end.", 1),
     limit=("integer", "How many lines to show.", 2000),
+    tail=("integer", "The last N lines, like `tail -n N`; replaces offset.", None),
 )
-def read(path, offset=1, limit=2000):
+def read(path, offset=1, limit=2000, tail=None):
+    if check_tail(tail) is not None:
+        offset, limit = -tail, tail
     rules = Rules(config())
     target = resolve(path, rules)
     if target.is_dir():
@@ -58,25 +65,6 @@ def read(path, offset=1, limit=2000):
         return body
     more = f"; offset={end + 1} for more" if end < len(lines) else ""
     return f"[{rel_of(target)}: lines {start + 1}-{end} of {len(lines)}{more}]\n{body}"
-
-
-@tool(
-    """
-    Create or replace a file with `content`, making its directories. Prefer edit
-    for a change to an existing file: it shows what changed and cannot clobber
-    the parts you did not mean to touch.
-    """,
-    path=PATH,
-    content=("string", "The whole new file."),
-)
-def write(path, content):
-    rules = Rules(config())
-    target = resolve(path, rules, write=True)
-    if target.is_dir():
-        raise ToolError(f"{rel_of(target)} is a directory")
-    existed = target.exists()
-    write_text(target, content)
-    return f"{'replaced' if existed else 'created'} {rel_of(target)} ({human(len(content.encode()))})"
 
 
 EDIT_ITEM = {
@@ -195,7 +183,7 @@ def apply_edits(rel, text, edits, label=""):
             find, put = change["old"], change["new"]
             if not find:
                 raise ToolError(
-                    f"{tag}old is empty; use write to replace the whole file"
+                    f"{tag}old is empty; to replace the whole file, write it instead"
                 )
             if find == put:
                 raise ToolError(f"{tag}old and new are the same")
@@ -295,7 +283,7 @@ def edit(path=None, old=None, new=None, replace_all=False, edits=None, files=Non
             )
         seen.add(target)
         if not target.is_file():
-            raise ToolError(f"no such file: {rel}; use write to create one")
+            raise ToolError(f"no such file: {rel}; edit changes existing files only")
         before = read_text(target)
         if before is None:
             raise ToolError(f"{rel} is binary")
@@ -400,6 +388,7 @@ def substitutions(pattern, replacement, rules, words, ignore_case, literal, mult
     not a letter, digit or underscore. Set dry_run to see the diff first.
     Nothing is written if any file that would change is protected.
     """,
+    lines=True,
     pattern=("string", "Regular expression (or plain text with literal).", None),
     replacement=("string", "What each match becomes.", None),
     rules=(
@@ -473,240 +462,6 @@ def sub(
     return "".join(out)
 
 
-@tool(
-    """
-    Search file contents with a Python regex, like grep -rn. Walks the tree
-    skipping binaries, denied paths and the skip list (.git, node_modules...).
-    mode `content` shows `path:line:text` (context lines use `-`), `files` only
-    the paths, `count` matches per file.
-    """,
-    pattern=("string", "Regular expression (or plain text with literal)."),
-    path=(*PATH, "."),
-    glob=GLOB,
-    mode=(
-        {"type": "string", "enum": ["content", "files", "count"]},
-        "What to report.",
-        "content",
-    ),
-    ignore_case=("boolean", "Case-insensitive.", False),
-    literal=("boolean", "Treat the pattern as plain text.", False),
-    word=("boolean", "Match whole words only.", False),
-    multiline=(
-        "boolean",
-        "Search whole files, so a pattern can span lines with \\n; "
-        "^ and $ still match at each line.",
-        False,
-    ),
-    context=("integer", "Lines of context around each match (content mode).", 0),
-    max_results=("integer", "Stop after this many matches (or files).", 200),
-)
-def grep(
-    pattern,
-    path=".",
-    glob=None,
-    mode="content",
-    ignore_case=False,
-    literal=False,
-    word=False,
-    multiline=False,
-    context=0,
-    max_results=200,
-):
-    rules = Rules(config())
-    rx = compile_pattern(pattern, ignore_case, literal, word, multiline)
-    out, shown, more = [], 0, 0
-    for file, rel in walk(resolve(path, rules), rules, glob):
-        text = read_text(file)
-        if text is None:
-            continue
-        lines = text.splitlines()
-        if multiline:
-            hits = sorted({text.count("\n", 0, m.start()) for m in rx.finditer(text)})
-        else:
-            hits = [i for i, line in enumerate(lines) if rx.search(line)]
-        if not hits:
-            continue
-        if mode == "files":
-            if shown < max_results:
-                out.append(rel)
-                shown += 1
-            else:
-                more += 1
-            continue
-        if mode == "count":
-            out.append(f"{rel}:{len(hits)}")
-            continue
-        keep = hits[: max(max_results - shown, 0)]
-        more += len(hits) - len(keep)
-        shown += len(keep)
-        matched, last = set(keep), -1
-        for i in keep:
-            lo, hi = max(i - context, 0), min(i + context, len(lines) - 1)
-            if context and last >= 0 and lo > last + 1:
-                out.append("--")
-            for j in range(max(lo, last + 1), hi + 1):
-                sep = ":" if j in matched else "-"
-                out.append(f"{rel}{sep}{j + 1}{sep}{lines[j][:MAX_LINE]}")
-            last = max(hi, last)
-    if not out:
-        return "no matches"
-    if more:
-        out.append(f"... {more} more not shown; narrow the search or raise max_results")
-    return "\n".join(out)
-
-
-@tool(
-    """
-    List a directory, like ls/find. Without a glob: its entries to `depth`
-    levels, directories marked with `/`, files with their sizes. With a glob:
-    every matching file under it, one path per line.
-    """,
-    path=(*PATH, "."),
-    glob=GLOB,
-    depth=("integer", "Levels to descend without a glob.", 1),
-    max_results=("integer", "Stop after this many entries.", 500),
-)
-def ls(path=".", glob=None, depth=1, max_results=500):
-    rules = Rules(config())
-    base = resolve(path, rules)
-    if not base.exists():
-        raise ToolError(f"no such path: {path}")
-    out = []
-    if glob or base.is_file():
-        for file, rel in walk(base, rules, glob):
-            out.append(f"{rel}  {human(file.stat().st_size)}")
-            if len(out) > max_results:
-                break
-    else:
-
-        def visit(directory, level):
-            try:
-                entries = sorted(
-                    directory.iterdir(), key=lambda p: (not p.is_dir(), p.name)
-                )
-            except OSError as e:
-                out.append(f"{'  ' * level}[{e.strerror}]")
-                return
-            for entry in entries:
-                if len(out) > max_results:
-                    return
-                if entry.name in rules.skip or rules.denied(rel_of(entry)):
-                    continue
-                pad = "  " * level
-                if entry.is_dir():
-                    out.append(f"{pad}{entry.name}/")
-                    if level + 1 < depth:
-                        visit(entry, level + 1)
-                else:
-                    out.append(f"{pad}{entry.name}  {human(entry.stat().st_size)}")
-
-        visit(base, 0)
-    if len(out) > max_results:
-        out[max_results:] = ["... more not shown; raise max_results"]
-    return "\n".join(out) or "(empty)"
-
-
-@tool(
-    """
-    Move or rename a file or directory, like mv; with copy, copy it instead,
-    like cp -r. A destination that is an existing directory receives the source
-    inside it.
-    """,
-    src=("string", "What to move, relative to the project root."),
-    dst=("string", "Where it goes."),
-    copy=("boolean", "Copy rather than move.", False),
-    overwrite=("boolean", "Replace a file already at the destination.", False),
-)
-def move(src, dst, copy=False, overwrite=False):
-    rules = Rules(config())
-    source = resolve(src, rules, write=not copy)
-    if not source.exists():
-        raise ToolError(f"no such path: {src}")
-    dest = resolve(dst, rules, write=True)
-    if dest.is_dir():
-        dest = resolve(rel_of(dest / source.name), rules, write=True)
-    if dest == source or dest.is_relative_to(source):
-        raise ToolError(
-            f"cannot {'copy' if copy else 'move'} {rel_of(source)} into itself"
-        )
-    if dest.exists():
-        if not overwrite or dest.is_dir():
-            raise ToolError(
-                f"{rel_of(dest)} exists" + ("" if dest.is_dir() else "; set overwrite")
-            )
-        dest.unlink()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if not copy:
-        shutil.move(str(source), str(dest))
-    elif source.is_dir():
-        shutil.copytree(source, dest, symlinks=True)
-    else:
-        shutil.copy2(source, dest)
-    return f"{'copied' if copy else 'moved'} {rel_of(source)} -> {rel_of(dest)}"
-
-
-@tool(
-    """
-    Rename many files at once by a regex over their names, the loop of `mv`s a
-    shell would write. Each file's name (not its directory) under `path` is
-    matched; a match is renamed in place to the name the replacement makes.
-    Refused as a whole if two files would land on one name, a name is taken,
-    or any file involved is protected. Set dry_run to see the list first.
-    """,
-    pattern=("string", "Regular expression over file names, e.g. `^(.*)\\.jpeg$`."),
-    replacement=("string", "The new name; takes \\1 and \\g<name>, e.g. `\\1.jpg`."),
-    path=(*PATH, "."),
-    glob=GLOB,
-    dry_run=("boolean", "Report the renames without making them.", False),
-)
-def rename(pattern, replacement, path=".", glob=None, dry_run=False):
-    rules = Rules(config())
-    rx = compile_pattern(pattern)
-    plan = []
-    for file, rel in walk(resolve(path, rules), rules, glob):
-        if not rx.search(file.name):
-            continue
-        try:
-            name = rx.sub(replacement, file.name)
-        except (re.error, IndexError) as e:
-            raise ToolError(f"bad replacement {replacement!r}: {e}") from None
-        if name == file.name:
-            continue
-        if not name or "/" in name or "\\" in name or name in (".", ".."):
-            raise ToolError(
-                f"{rel} would be renamed to {name!r}, which is not a file name"
-            )
-        plan.append((file, file.with_name(name)))
-    if not plan:
-        return "no names match"
-    sources = {src for src, _ in plan}
-    seen = {}
-    for src, dst in plan:
-        if dst in seen:
-            raise ToolError(
-                f"{rel_of(seen[dst])} and {rel_of(src)} would both become "
-                f"{rel_of(dst)}; nothing renamed"
-            )
-        seen[dst] = src
-        # A name freed by another rename in the same batch is not taken.
-        if dst.exists() and dst not in sources:
-            raise ToolError(f"{rel_of(dst)} exists; nothing renamed")
-        for end in (src, dst):
-            resolve(rel_of(end), rules, write=True)
-    lines = [f"{rel_of(src)} -> {dst.name}" for src, dst in plan]
-    if dry_run:
-        return "\n".join([*lines, f"would rename {len(plan)} file(s)"])
-    # Through temporary names, so a swap or a chain (a->b, b->c) cannot clobber.
-    staged = []
-    for i, (src, dst) in enumerate(plan):
-        temp = src.with_name(f".gci-rename-{i}-{src.name}")
-        src.rename(temp)
-        staged.append((temp, dst))
-    for temp, dst in staged:
-        temp.rename(dst)
-    return "\n".join([*lines, f"renamed {len(plan)} file(s)"])
-
-
 def contents_or_refuse(directory, rules):
     """Every file under `directory`, or a ToolError if one is protected or denied.
 
@@ -723,38 +478,32 @@ def contents_or_refuse(directory, rules):
     return inside
 
 
-@tool(
-    """
-    Delete a file, or a directory with recursive. Permanent: there is no trash.
-    """,
-    path=PATH,
-    recursive=("boolean", "Delete a non-empty directory and everything in it.", False),
-)
-def delete(path, recursive=False):
-    rules = Rules(config())
-    target = resolve(path, rules, write=True)
-    rel = rel_of(target)
-    if target == core.ROOT:
-        raise ToolError("refusing to delete the project root")
-    if target.is_symlink() or target.is_file():
-        target.unlink()
-        return f"deleted {rel}"
-    if not target.is_dir():
-        raise ToolError(f"no such path: {rel}")
-    inside = contents_or_refuse(target, rules)
-    if any(target.iterdir()):
-        if not recursive:
-            raise ToolError(f"{rel} is not empty; set recursive")
-        shutil.rmtree(target)
-        return f"deleted {rel} ({len(inside)} file(s))"
-    target.rmdir()
-    return f"deleted {rel}"
+# Read-only git can still run code: a hook, or fsmonitor.
+SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}"]
+
+
+def git_tracked(rel):
+    """The files git tracks under `rel`; none if there is no git or no repo."""
+    try:
+        proc = subprocess.run(
+            ["git", *SAFE_GIT, "ls-files", "--", rel],
+            cwd=core.ROOT,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return proc.stdout.decode("utf-8", errors="replace").splitlines()
 
 
 @tool(
     f"""
-    Empty the project's scratch directory, `{DEFAULT_TMP}/` unless the settings'
-    `tmp` names another: the place for temporary files, kept out of git and out
+    Empty the project's scratch directory, `{DEFAULT_TMP}/` unless the server's
+    instructions name another: the place for temporary files, kept out of git and out
     of every sync. Everything inside goes, the directory itself stays. Refused
     if git tracks anything in it, or it holds a protected or denied file. Set
     dry_run to see what it holds first.
@@ -762,23 +511,19 @@ def delete(path, recursive=False):
     dry_run=("boolean", "Report what would be removed without removing it.", False),
 )
 def clean_tmp(dry_run=False):
-    # Here rather than at the top, so the git tools register after these.
-    from .git import run_git
-
     cfg = config()
     rules = Rules(cfg)
     target = resolve(tmp_rel(cfg), rules, write=True)
     rel = rel_of(target)
     if target == core.ROOT:
-        raise ToolError("the settings' tmp is the project root; refusing to empty it")
+        raise ToolError(
+            "the scratch directory is the project root; refusing to empty it"
+        )
     if not target.exists():
         return f"{rel}/ does not exist; nothing to clean"
     if not target.is_dir():
         raise ToolError(f"{rel} is a file, not a directory")
-    try:
-        tracked = run_git("ls-files", "--", rel).splitlines()
-    except ToolError:
-        tracked = []  # no git, or not a repo: nothing can be tracked
+    tracked = git_tracked(rel)
     if tracked:
         raise ToolError(
             f"git tracks files in {rel}/, so it is not scratch: "
@@ -795,51 +540,3 @@ def clean_tmp(dry_run=False):
         else:
             entry.unlink()
     return f"removed {summary}"
-
-
-@tool("Make a directory and any missing parents, like mkdir -p.", path=PATH)
-def mkdir(path):
-    rules = Rules(config())
-    target = resolve(path, rules, write=True)
-    if target.exists() and not target.is_dir():
-        raise ToolError(f"{rel_of(target)} exists and is a file")
-    target.mkdir(parents=True, exist_ok=True)
-    return f"{rel_of(target)}/"
-
-
-@tool(
-    """
-    Unified diff of two files, or of a file against `content` (what it would
-    become). Empty when they match.
-    """,
-    a=("string", "The first file."),
-    b=("string", "The second file.", None),
-    content=("string", "Text to compare `a` against, instead of b.", None),
-    context=("integer", "Lines of context.", 3),
-)
-def diff(a, b=None, content=None, context=3):
-    if (b is None) == (content is None):
-        raise ToolError("pass exactly one of b or content")
-    rules = Rules(config())
-    left = resolve(a, rules)
-    before = read_text(left) if left.is_file() else ""
-    if before is None:
-        raise ToolError(f"{rel_of(left)} is binary")
-    if content is None:
-        right = resolve(b, rules)
-        after = read_text(right) if right.is_file() else ""
-        if after is None:
-            raise ToolError(f"{rel_of(right)} is binary")
-    else:
-        after = content
-    lines = difflib.unified_diff(
-        before.splitlines(keepends=True),
-        after.splitlines(keepends=True),
-        fromfile=a,
-        tofile=b or f"{a} (content)",
-        n=context,
-    )
-    return (
-        "".join(line if line.endswith("\n") else line + "\n" for line in lines)
-        or "identical"
-    )

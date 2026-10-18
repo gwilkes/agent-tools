@@ -88,6 +88,13 @@ def self_test():
                                 ],
                                 "timeout": 1,
                             },
+                            "nap": {
+                                "command": [
+                                    PYTHON_TOKEN,
+                                    "-c",
+                                    "import time; print('napping', flush=True); time.sleep(60)",
+                                ]
+                            },
                             "two": {
                                 "args": True,
                                 "steps": [
@@ -169,15 +176,29 @@ def self_test():
                     "result"
                 ]["tools"]
             }
-            assert {
+            assert names == {
+                "read",
                 "edit",
-                "rename",
+                "sub",
+                "clean_tmp",
                 "json",
+                "list_scripts",
                 "run_script",
+                "job",
+                "sync",
+                "hosts",
+                "kill",
                 "self_test",
                 "restart",
                 "list_tools",
-            } <= names and "python" not in names, names
+            }, names
+            # The settings file is the user's; an agent works from list_scripts.
+            schemas = json.dumps(
+                handle({"jsonrpc": "2.0", "id": 0, "method": "tools/list"})["result"]
+            )
+            assert (
+                CONFIG not in schemas and CONFIG not in init["instructions"]
+            ), "a tool description or the instructions name the settings file"
             assert (
                 handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
                 is None
@@ -190,7 +211,8 @@ def self_test():
             ), "a self-update archive does not round-trip to this version"
             checks += 4
 
-            ok("write", "created", path="src/a.py", content="x = 1\ny = 2\nx = 1\n")
+            (root / "src").mkdir()
+            (root / "src" / "a.py").write_text("x = 1\ny = 2\nx = 1\n")
             ok("read", "     2\ty = 2", path="src/a.py")
             ok("read", "lines 2-2 of 3; offset=3", path="src/a.py", offset=2, limit=1)
             refused("edit", "occurs 2 times", path="src/a.py", old="x = 1", new="x = 9")
@@ -216,19 +238,8 @@ def self_test():
                 path="src/a.py",
                 offset=-1,
             )
-
-            ok("grep", "src/a.py:3:x = 0", pattern=r"x = \d")
-            ok(
-                "grep",
-                "src/a.py-1-x = 0\nsrc/a.py:2:y = 3\nsrc/a.py-3-x = 0",
-                pattern="y",
-                context=1,
-                path="src",
-            )
-            ok("grep", "src/a.py:2", pattern="x", mode="count")
-            ok("grep", "src/a.py:1:x = 0", pattern=r"0\ny", multiline=True)
-            text = ok("grep", "no matches", pattern="TOKEN")
-            assert ".env" not in text and "secrets" not in text
+            ok("read", "[src/a.py: lines 2-3 of 3]", path="src/a.py", tail=2)
+            refused("read", "tail must be a positive integer", path="src/a.py", tail=0)
 
             ok(
                 "sub",
@@ -337,36 +348,22 @@ def self_test():
                 one.read_text() == "1\ntwo\nthree\nfour\n"
             ), "a failed multi-file edit wrote"
 
-            ok("mkdir", "out/deep/", path="out/deep")
-            ok(
-                "move",
-                "copied src/a.py -> out/a.py",
-                src="src/a.py",
-                dst="out",
-                copy=True,
-            )
-            ok("move", "moved out/a.py -> out/b.py", src="out/a.py", dst="out/b.py")
-            ok("diff", "identical", a="src/a.py", b="out/b.py")
-            ok("diff", "+tail", a="src/a.py", content="x = 5\ny = 3\nx = 5\ntail\n")
-            text = ok("ls", "src/", depth=2)
-            assert "a.py" in text and ".env" not in text and "node_modules" not in text
-            ok("ls", "out/b.py", glob="*.py")
-            refused("delete", "not empty", path="out")
-            ok("delete", "deleted out", path="out", recursive=True)
-
             refused("read", "denied", path=".env")
             refused("read", "denied", path="secrets/key")
             refused("read", "outside the project root", path="../x")
-            refused("write", "protected", path=CONFIG, content="{}")
-            refused("move", "protected", src=CONFIG, dst="c.json")
+            refused("edit", "protected", path=CONFIG, old="{", new="[")
+            refused("sub", "protected", pattern="scripts", replacement="x", path=CONFIG)
             ok("read", "binary", path="blob.bin")
 
-            ok("run_script", "hello: say hi")
+            ok("list_scripts", "hello: say hi")
+            refused("run_script", "required", args=["x"])
             ok("run_script", "hi there", name="hello", args=["there"])
             refused("run_script", "exit 3", name="fail")
             refused("run_script", "takes no arguments", name="fail", args=["x"])
             refused("run_script", "timeout", name="slow")
             refused("run_script", "no script", name="rm")
+            refused("run_script", "bad pattern", name="hello", grep="(")
+            ok("list_scripts", "hello: say hi", grep="^  hello")
             refused("python", "unknown tool", code="print(1)")
 
             text = ok("run_script", "step two x", name="two", args=["x"])
@@ -386,7 +383,29 @@ def self_test():
             text = call("run_script", name="gate-all")[0]
             assert "SKIP  elsewhere" in text and "OK    hello" in text, text
             assert "some FAILED" in text, text
-            ok("run_script", "gate: runs hello, fail, two")
+            ok("list_scripts", "gate: runs hello, fail, two")
+
+            # A detached run answers at once, naming its job and log; job follows it.
+            def detached(expect, **args):
+                text = ok("run_script", expect, detach=True, **args)
+                return re.search(r"detached as job (\d+)", text).group(1), text
+
+            jid, text = detached("detached as job", name="two", args=["x"])
+            assert re.search(r"^log: \S+$", text, re.MULTILINE), text
+            ok("job", "two x: exit 0 in", id=jid, wait=30)
+            ok("job", f"{jid}  two x  exit 0 in")
+            jid, _ = detached("fail: detached", name="fail")
+            refused("job", "fail: exit 3", id=jid, wait=30)
+            refused("run_script", "no script", name="rm", detach=True)
+            refused("job", "no detached run 999", id="999")
+            jid, _ = detached("nap: detached", name="nap")
+            text = ok("job", "nap: running for", id=jid)
+            if os.name != "nt":
+                refused("restart", f"detached run(s) still going: {jid}")
+            began = time.monotonic()
+            refused("job", "killed by job(stop=true)", id=jid, stop=True)
+            assert time.monotonic() - began < 10, "a stop did not end the run promptly"
+            ok("job", f"{jid}  nap  exit 137")
 
             # Live output: progress notifications for a client that asks, and a log file.
             def watched(script):
@@ -450,13 +469,18 @@ def self_test():
             checks += 4
 
             text = ok(
-                "list_tools", "run_script(name?, args?, hosts?, sync=true, proxy?)"
+                "list_tools",
+                "run_script(name, args?, hosts?, sync=true, proxy?, detach=false, grep?, tail?)",
             )
+            listed = ok(
+                "list_tools", "read(path, offset=1, limit=2000, tail?)", grep=r"^\w"
+            )
+            assert "    - " not in listed, listed
             assert (
-                "    - pattern (string, required):" in text and "restart()" in text
+                "    - name (string, required):" in text and "restart()" in text
             ), text
-            assert "switched off" not in text, text
-            ok("list_tools", "grep(pattern, ", names=["grep"], brief=True)
+            assert "switched off for this project:" not in text, text
+            ok("list_tools", "sub(pattern?, ", names=["sub"], brief=True)
             refused("list_tools", "no such tool: nope", names=["nope"])
             argv, env = core.self_command("list-mcp", "--brief")
             listed = subprocess.run(
@@ -505,43 +529,6 @@ def self_test():
                 "a": {"b": [1, 2, "x"], "c": 3}
             }
 
-            (root / "r").mkdir()
-            for name in ("one.jpeg", "two.jpeg", "x.txt"):
-                (root / "r" / name).write_text(name)
-            ok(
-                "rename",
-                "would rename 2",
-                pattern=r"^(.*)\.jpeg$",
-                replacement=r"\1.jpg",
-                path="r",
-                dry_run=True,
-            )
-            assert (root / "r" / "one.jpeg").exists(), "a dry run renamed"
-            ok(
-                "rename",
-                "r/one.jpeg -> one.jpg",
-                pattern=r"^(.*)\.jpeg$",
-                replacement=r"\1.jpg",
-                path="r",
-            )
-            assert (root / "r" / "two.jpg").read_text() == "two.jpeg"
-            refused(
-                "rename",
-                "would both become",
-                pattern=r"^.*\.jpg$",
-                replacement="same.jpg",
-                path="r",
-            )
-            refused(
-                "rename", "exists", pattern=r"^x\.txt$", replacement="one.jpg", path="r"
-            )
-            assert sorted(p.name for p in (root / "r").iterdir()) == [
-                "one.jpg",
-                "two.jpg",
-                "x.txt",
-            ]
-            checks += 2
-
             # Long output is cut to the settings' limit, naming the log that has all of it.
             saved_cfg = (root / CONFIG).read_text()
             cfg = json.loads(saved_cfg)
@@ -560,6 +547,22 @@ def self_test():
             assert (
                 "line 1500\n" in (root / found.group(1)).read_text()
             ), "the log is not whole"
+            # grep, then tail, before the cut; the log line outlives both.
+            # 3001 lines: the `$ command` echo counts too.
+            text = ok(
+                "run_script",
+                "100 of 3001 line(s) match; the last 2 of 100 shown",
+                name="spam",
+                grep=r"^line 12\d\d$",
+                tail=2,
+            )
+            assert text.splitlines()[1].startswith("log: "), text
+            assert text.endswith("line 1298\nline 1299"), text
+            assert "truncated" not in text, text
+            # The tail of a run's log, without running it again.
+            ok("read", "line 2999", path=found.group(1), offset=-1)
+            # The backstop cut names the filters a tool takes.
+            ok("list_tools", "pass grep or tail to narrow it")
             (root / CONFIG).write_text(saved_cfg)
 
             # Every run so far left its log in tmp/; start from an empty one.
@@ -576,18 +579,6 @@ def self_test():
             (root / "tmp" / ".env").write_text("TOKEN=t\n")
             refused("clean_tmp", "protected or denied")
             (root / "tmp" / ".env").unlink()
-            # A denied file deep in a directory must stop a recursive delete of it.
-            (root / "d" / "e").mkdir(parents=True)
-            (root / "d" / "e" / ".env").write_text("TOKEN=d\n")
-            refused(
-                "delete",
-                "protected or denied files: d/e/.env",
-                path="d",
-                recursive=True,
-            )
-            assert (root / "d" / "e" / ".env").exists(), "a denied file was deleted"
-            shutil.rmtree(root / "d")
-
             # Not `checks += f()`: that reads `checks` before f runs, losing what
             # f's own ok() and refused() calls count.
             extra = self_test_git(root, ok, refused)
@@ -605,10 +596,10 @@ def self_test():
 
 
 def self_test_git(root, ok, refused):
-    """The read-only git tools over a scratch repo, with a tracked denied file
-    that must never show up, and a hook that must never run."""
+    """clean_tmp's git check over a scratch repo, with a hook that must never
+    run, and .git/ protected from edits."""
     if shutil.which("git") is None:
-        print("self-test: git is not on PATH; skipping the git tools")
+        print("self-test: git is not on PATH; skipping the git checks")
         return 0
 
     def git(*args):
@@ -641,26 +632,6 @@ def self_test_git(root, ok, refused):
         hook = hooks / name
         hook.write_text(f"#!/bin/sh\ntouch '{fired}'\n")
         hook.chmod(0o755)
-    (root / "src" / "a.py").write_text("x = 5\ny = 3\nx = 5\nadded\n")
-    (root / ".env").write_text("TOKEN=changed\n")
-
-    ok("git_status", "## main")
-    text = ok("git_status", " M src/a.py")
-    assert ".env" not in text, f"a denied file in status:\n{text}"
-    text = ok("git_diff", "+added")
-    assert "TOKEN=" not in text, f"a denied file in a diff:\n{text}"
-    ok("git_diff", "src/a.py", stat=True)
-    ok("git_diff", "no differences", staged=True)
-    ok("git_log", "self-test: first commit")
-    # .env and secrets/key are tracked, but denied, so their contents never show.
-    text = ok("git_show", "first commit")
-    assert "TOKEN=" not in text and "node_modules/dep.js" in text, f"show:\n{text}"
-    ok("git_blame", "(self-test", path="src/a.py", start=1, end=1)
-    ok("git_branch", "* main")
-    refused("git_show", "not a ref", ref="HEAD:.env")
-    refused("git_log", "not a ref", ref="--output=leak.txt")
-    refused("git_blame", "denied", path=".env")
-    refused("write", "protected", path=".git/hooks/pre-commit", content="#!/bin/sh\n")
     refused(
         "edit",
         "protected",
@@ -668,14 +639,13 @@ def self_test_git(root, ok, refused):
         old="[core]",
         new="[core]\n\tpager = sh",
     )
-    assert not fired.exists(), "a git hook ran during a read-only tool"
-    assert not (root / "leak.txt").exists(), "a ref became an option"
     # A tmp/ that git tracks is not scratch, and clean_tmp must not empty it.
     (root / "tmp" / "kept.txt").write_text("tracked\n")
     git("add", "tmp/kept.txt")
     git("commit", "-qm", "track a tmp file")
     refused("clean_tmp", "git tracks files in tmp/, so it is not scratch: tmp/kept.txt")
     assert (root / "tmp" / "kept.txt").exists()
+    assert not fired.exists(), "a git hook ran during clean_tmp's check"
 
     # The scratch repo's history must not travel with the later sync tests.
     # Its objects are read-only, which Windows will not delete as they are.
@@ -837,6 +807,17 @@ def self_test_remote(far, ok, refused, call):
             (far / "tmp" / "gci" / "logs").glob("gate-*.log")
         ), "the host kept no log"
         ok("kill", "nothing running", hosts=["box"])
+        text = ok(
+            "run_script",
+            "box log: ",
+            name="hello",
+            args=["far"],
+            hosts=["box"],
+            detach=True,
+        )
+        jid = re.search(r"detached as job (\d+)", text).group(1)
+        text = ok("job", "=== box: exit 0 in", id=jid, wait=60)
+        assert "hi far" in text and "ended in" in text, text
         try:
             Remote("box", f"http://127.0.0.1:{port}", "wrong").get_json("/info")
             raise AssertionError("a wrong key was accepted")

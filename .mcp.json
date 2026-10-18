@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gci": {
+      "command": "python",
+      "args": ["-m", "gci", "mcp"]
+    }
+  }
+}

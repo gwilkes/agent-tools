@@ -4,7 +4,7 @@ MCP server lists and calls whatever is registered by the time it answers."""
 import json
 import textwrap
 
-from ..core import CONFIG, ToolError
+from ..core import ToolError, filter_text
 
 TOOLS = {}
 
@@ -17,10 +17,41 @@ class Tool:
         return self.enabled is None or self.enabled(cfg)
 
 
-def tool(description, enabled=None, **params):
+GREP = (
+    "string",
+    "Only the lines of the answer matching this Python regex, like `| grep -E`; "
+    "`(?i)` at its start ignores case.",
+    None,
+)
+TAIL = (
+    "integer",
+    "Only the last N lines of the answer (after grep), like `| tail -n N`.",
+    None,
+)
+
+
+def filtered(fn):
+    """`fn` with its answer put through `grep` and `tail`."""
+
+    def run(grep=None, tail=None, **args):
+        out = fn(**args)
+        text, failed = out if isinstance(out, tuple) else (out, False)
+        return filter_text(text, grep, tail), failed
+
+    return run
+
+
+def tool(description, enabled=None, lines=False, **params):
     """Register a tool. Each param is (schema, description) when required, or
     (schema, description, default) when not; a schema is a type name or a dict.
-    `enabled(cfg)`, if given, decides per call whether the tool is listed."""
+    `enabled(cfg)`, if given, decides per call whether the tool is listed.
+
+    `lines` gives the tool `grep` and `tail`, applied to whatever it answers.
+    A tool whose answer is already cut (from the head, or around a log
+    pointer) takes them as params of its own instead, to filter before the cut.
+    The function itself is returned unwrapped, for the CLI to call."""
+    if lines:
+        params = {**params, "grep": GREP, "tail": TAIL}
 
     def wrap(fn):
         props, required = {}, []
@@ -33,7 +64,7 @@ def tool(description, enabled=None, **params):
                 schema["default"] = default[0]
             props[name] = schema
         TOOLS[fn.__name__] = Tool(
-            fn,
+            filtered(fn) if lines else fn,
             {
                 "name": fn.__name__,
                 "description": textwrap.dedent(description).strip(),
@@ -78,7 +109,7 @@ def describe_tools(cfg, names=None, brief=False):
     """The registered tools laid out for a person, or a model, to read.
 
     Each tool is its signature, then (unless `brief`) its description and one
-    line per parameter. Tools the settings switch off are named at the end
+    line per parameter. Tools switched off for this project are named at the end
     rather than hidden, so a missing tool is never a mystery.
     """
     unknown = sorted(set(names or []) - set(TOOLS))
@@ -112,11 +143,12 @@ def describe_tools(cfg, names=None, brief=False):
             )
         blocks.append("\n".join(lines))
     if off:
-        blocks.append(f"switched off by {CONFIG}: {', '.join(off)}")
+        blocks.append(f"switched off for this project: {', '.join(off)}")
     return "\n\n".join(blocks)
 
 
 PATH = ("string", "File or directory, relative to the project root.")
+FILE = ("string", "The file, relative to the project root.")
 GLOB = (
     "string",
     "Only files matching this glob: `*.py` matches a name at any depth, "

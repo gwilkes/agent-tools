@@ -12,6 +12,7 @@ from .core import (
     Rules,
     ToolError,
     clip_lines,
+    filter_lines,
     log_of,
     output_limit,
     rel_of,
@@ -165,12 +166,25 @@ def local_script(cfg, name, args, emit, stop=None, watch=None, quiet=None):
         return run_plan(plan, out, stop or interrupted, hush)
 
 
-def script_report(cfg, name, args, watch=None):
+def report_lines(lines, limit, grep=None, tail=None):
+    """A run's result lines through `grep` and `tail`, then cut to `limit`.
+    The `log:` line survives both, so the whole of it can still be found."""
+    see = log_of(lines)
+    pointer = f"log: {see}"
+    lines, note = filter_lines(lines, grep, tail, pinned=lambda line: line == pointer)
+    if note:
+        at = lines.index(pointer) + 1 if see else 0
+        lines[at:at] = [note]
+    return clip_lines(lines, limit, see=see)
+
+
+def script_report(cfg, name, args, watch=None, grep=None, tail=None):
     """Run a settings script here to its end. Returns (report, failed), the
     report cut to the settings' output limit with a pointer to the full log."""
+    filter_lines([], grep, tail)
     started = time.monotonic()
     lines = []
     code = local_script(cfg, name, args, lines.append, watch=watch)
     head = f"{name}: exit {code} in {time.monotonic() - started:.1f}s"
-    body = clip_lines(lines, output_limit(cfg) - len(head) - 1, see=log_of(lines))
+    body = report_lines(lines, output_limit(cfg) - len(head) - 1, grep, tail)
     return f"{head}\n{body}".rstrip(), code != 0

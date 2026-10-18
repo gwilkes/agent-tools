@@ -16,13 +16,11 @@ from .core import (
     VERSION,
     Rules,
     ToolError,
-    clip_lines,
     host_map,
     human,
-    log_of,
     remote_cfg,
 )
-from .procs import RunLog, tee
+from .procs import RunLog, report_lines, tee
 from .server import JOB_POLL, KEY_HEADER, LIVE_PREFIX, USER_AGENT, VERSION_HEADER
 from .sync import file_hash, pack_sources, sync_ignore, sync_walk
 
@@ -112,7 +110,7 @@ def host_url(cfg, name, via_proxy):
     if via_proxy:
         proxy = remote.get("proxy")
         if not proxy:
-            raise ToolError(f"no remote.proxy in {core.CONFIG}")
+            raise ToolError("this project sets up no proxy for reaching hosts")
         if name not in hosts:
             raise ToolError(
                 f"{name} is not in remote.hosts; the proxy routes only those"
@@ -252,12 +250,15 @@ ACTIVE_JOBS = set()
 ACTIVE_JOBS_LOCK = threading.Lock()
 
 
-def remote_script(cfg, host, name, args, do_sync, proxy, emit, watch=None, quiet=None):
+def remote_script(
+    cfg, host, name, args, do_sync, proxy, emit, watch=None, quiet=None, started=None
+):
     """Run a settings script on a host and follow it to its exit code.
 
     Logged here as it arrives, to tmp/gci/logs/HOST-NAME-*.log, the same way a
     local run is. `emit` gets what belongs in the result; `quiet` gets the
     output a gauntlet's result leaves out; `watch` and the log get both.
+    `started(remote, job_id)` hears of the host's job once there is one.
     """
     with RunLog(cfg, f"{host}-{name}") as log:
         out = tee(log.write, watch, emit)
@@ -269,6 +270,8 @@ def remote_script(cfg, host, name, args, do_sync, proxy, emit, watch=None, quiet
             remote_sync(cfg, remote, False, out)
         job_id = remote.post_json("/script", {"script": name, "args": args})["job"]
         entry = (remote, job_id)
+        if started:
+            started(remote, job_id)
         with ACTIVE_JOBS_LOCK:
             ACTIVE_JOBS.add(entry)
         # Left registered if following fails, so Ctrl-C still reaches it.
@@ -376,15 +379,22 @@ def lane_word(code):
     return "did not run" if code is None else f"exit {code}"
 
 
-def lane_report(results, limit=MAX_OUTPUT):
-    """One section per lane, each cut to its share of `limit` with a pointer
-    to that lane's log. Returns (text, failed)."""
+# A lane's code in a report made while it is still going.
+RUNNING = "running"
+
+
+def lane_report(results, limit=MAX_OUTPUT, grep=None, tail=None):
+    """One section per lane, each through `grep` and `tail` and cut to its
+    share of `limit`, with a pointer to that lane's log. Returns (text, failed)."""
     if not results:
         raise ToolError("no hosts named")
     budget = limit // len(results) - 100
     parts = [
-        f"=== {name}: {lane_word(code)} in {seconds:.1f}s ===\n"
-        f"{clip_lines(lines, budget, see=log_of(lines))}"
+        f"=== {name}: "
+        f"{'running for' if code == RUNNING else lane_word(code) + ' in'} {seconds:.1f}s ===\n"
+        f"{report_lines(lines, budget, grep, tail)}"
         for name, lines, code, seconds in results
     ]
-    return "\n\n".join(parts), any(code != 0 for _, _, code, _ in results)
+    return "\n\n".join(parts), any(
+        code not in (0, RUNNING) for _, _, code, _ in results
+    )

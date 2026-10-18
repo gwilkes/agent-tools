@@ -13,12 +13,12 @@ from pathlib import Path
 
 from . import core
 from .core import (
-    CONFIG,
     MAX_OUTPUT,
     VERSION,
     ToolError,
     clip,
     describe_hosts,
+    filter_lines,
     describe_scripts,
     output_limit,
     safe_config,
@@ -27,12 +27,11 @@ from .core import (
 from .procs import stream_command
 from .progress import CURRENT as PROGRESS
 from .progress import Progress
-from .tools import TOOLS, describe_tools, tool
+from .tools import GREP, TAIL, TOOLS, describe_tools, tool
 
 # Imported for what importing does: each module registers its tools, in this order.
 from .tools import files as _files
 from .tools import data as _data
-from .tools import git as _git
 from .tools import run as _run
 
 # Echoed back when the client asks for a version this server predates.
@@ -65,6 +64,13 @@ def restart():
     if others > 0:
         raise ToolError(
             f"{others} other call(s) still running; restart once they finish"
+        )
+    # A detached run lives in a thread of this process, which the exec ends.
+    detached = _run.running_detached()
+    if detached:
+        raise ToolError(
+            f"detached run(s) still going: {', '.join(d.id for d in detached)}; "
+            "wait for them or stop them with job"
         )
     # Every module, not just the CLI's: a break in one this process imports
     # lazily would otherwise pass the check and take the server down on exec.
@@ -108,8 +114,12 @@ def restart():
     server loaded, and touches nothing outside its scratch directories.
     """,
     timeout=("integer", "Seconds before it is killed.", 300),
+    grep=GREP,
+    tail=TAIL,
 )
-def self_test(timeout=300):
+def self_test(timeout=300, grep=None, tail=None):
+    # A bad pattern fails now, not after minutes of testing.
+    filter_lines([], grep, tail)
     argv, env = core.self_command("self-test")
     started = time.monotonic()
     lines = []
@@ -122,15 +132,19 @@ def self_test(timeout=300):
 
     code, why = stream_command(argv, core.ROOT, timeout, emit, env=env)
     head = f"self-test: {why or f'exit {code}'} in {time.monotonic() - started:.1f}s"
-    return "\n".join([head, *lines]).rstrip(), why is not None or code != 0
+    lines, note = filter_lines(lines, grep, tail)
+    body = [head, note] if note else [head]
+    return "\n".join([*body, *lines]).rstrip(), why is not None or code != 0
 
 
 @tool(
     """
     List every tool this server offers: its signature, what it does and its
-    parameters, plus any the settings switch off. The same tools a client's
-    tools/list sees, laid out for reading. Pass `names` for just those.
+    parameters, plus any switched off for this project. The same tools a client's
+    tools/list sees, laid out for reading. Pass `names` for just those, or
+    grep: `^\\w` keeps the signatures alone, `tail\\?` the tools that take tail.
     """,
+    lines=True,
     names=({"type": "array", "items": {"type": "string"}}, "Only these tools.", None),
     brief=("boolean", "One line per tool: its signature and first sentence.", False),
 )
@@ -142,14 +156,15 @@ def instructions():
     cfg = safe_config()
     return (
         textwrap.dedent(f"""
-        File, search and process tools for {core.ROOT}, standing in for a shell.
-        Paths are relative to that root and cannot leave it. Edit files with edit
-        (exact replacement) or sub (regex across files), search with grep, list
-        with ls, and run builds, tests and git through run_script, which runs only
-        the scripts {CONFIG} defines. Pass run_script `hosts` to run a script on
-        other machines at once (this tree is synced to each first); `local` is
-        this one. Put temporary files under {tmp_rel(cfg)}/ and empty it with
-        clean_tmp when done. Scripts now:
+        Script and file tools for {core.ROOT}; paths are relative to that root
+        and cannot leave it. Run builds and tests through run_script, which runs
+        only the project's scripts (list_scripts lists them, as does the end of
+        this note). Pass it `hosts` to run a script on other machines at once
+        (this tree is synced to each first; `local` is this one), or `detach` to
+        run in the background and follow the run with job. Edit files with edit
+        (exact text, line ranges, several files at once) or sub (regex across
+        files), and query or edit JSON with json. Put temporary files under {tmp_rel(cfg)}/ and empty it with
+        clean_tmp when done. Scripts:
         {{scripts}}
         Hosts:
         {{hosts}}
@@ -160,10 +175,13 @@ def instructions():
     )
 
 
-def result(text, error=False, limit=MAX_OUTPUT):
+def result(text, error=False, limit=MAX_OUTPUT, hint=None):
     """A tool result. Scripts cut their own output with a pointer to their log;
     this cut is the backstop for everything else."""
-    return {"content": [{"type": "text", "text": clip(text, limit)}], "isError": error}
+    return {
+        "content": [{"type": "text", "text": clip(text, limit, hint)}],
+        "isError": error,
+    }
 
 
 def call_tool(name, args, progress=None):
@@ -188,7 +206,9 @@ def call_tool(name, args, progress=None):
     finally:
         PROGRESS.reset(token)
     text, failed = out if isinstance(out, tuple) else (out, False)
-    return result(text, failed, output_limit(cfg))
+    narrows = {"grep", "tail"} & set(entry.schema["inputSchema"]["properties"])
+    hint = f"pass {' or '.join(sorted(narrows))} to narrow it" if narrows else None
+    return result(text, failed, output_limit(cfg), hint)
 
 
 def handle(msg, notify=None):
@@ -308,6 +328,7 @@ def serve_mcp():
                 continue
             chunk = os.read(fd, 1 << 16)
             if not chunk:
+                _run.stop_detached()
                 return 0
             pending += chunk
             continue

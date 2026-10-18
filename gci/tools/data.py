@@ -13,7 +13,7 @@ from ..core import (
     unified,
     write_text,
 )
-from . import PATH, tool
+from . import FILE, tool
 
 # One step of a query: `.name` (or a bare first name), `[3]`, or `["any key"]`.
 STEP = re.compile(r'\.?([^.\[\]"]+)|\[(-?\d+)\]|\["((?:[^"\\]|\\.)*)"\]')
@@ -118,7 +118,8 @@ def indent_of(text):
     `delete`, removes it. An edit rewrites the file in standard layout, keeping
     its indent, and answers with the diff.
     """,
-    path=PATH,
+    lines=True,
+    path=FILE,
     query=("string", "Where in the document; omit for the whole of it.", None),
     value=("string", "JSON text to set at the query.", None),
     delete=("boolean", "Remove what the query names.", False),

@@ -29,7 +29,6 @@ from pathlib import Path
 
 from . import core
 from .core import (
-    CONFIG,
     DEFAULT_TIMEOUT,
     Rules,
     ToolError,
@@ -114,7 +113,7 @@ def script_plan(cfg, name, args, nested=False):
     entry = (cfg.get("scripts") or {}).get(name)
     if not isinstance(entry, dict):
         raise ToolError(
-            f"no script {name!r} in {CONFIG}; known:\n{describe_scripts(cfg)}"
+            f"no script {name!r}; the scripts are:\n{describe_scripts(cfg)}"
         )
     platforms = entry.get("platforms")
     if platforms and not any(on_platform(p) for p in platforms):
@@ -130,10 +129,7 @@ def script_plan(cfg, name, args, nested=False):
         )
     args = list(args or [])
     if args and not entry.get("args"):
-        raise ToolError(
-            f'script {name!r} takes no arguments; set "args": true in {CONFIG} '
-            "to allow them"
-        )
+        raise ToolError(f"script {name!r} takes no arguments")
     plan = Plan(name, kinds[0], cfg)
     values = var_values(cfg)
     plan.timeout = entry.get("timeout", cfg.get("timeout", DEFAULT_TIMEOUT))

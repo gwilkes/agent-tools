@@ -188,6 +188,7 @@ def main(argv=None):
             return 0
         if args.word == "scripts":
             cfg = config()
+            print(f"from {CONFIG}:")
             print(f"scripts:\n{describe_scripts(cfg)}\nhosts:\n{describe_hosts(cfg)}")
             return 0
         if args.word == "run":
