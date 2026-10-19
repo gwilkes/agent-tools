@@ -1,0 +1,115 @@
+{
+    "$schema": "../gci/settings.schema.json",
+    "deny": [
+        ".env",
+        ".env.*",
+        "secrets/**"
+    ],
+    "edit_self": true,
+    "scripts": {
+        "black": {
+            "description": "formats code with python-black",
+            "command": [
+                "black",
+                "gci",
+                "tests"
+            ]
+        },
+        "check": {
+            "description": "everything worth running before a commit: compile, style, then the tests",
+            "run": [
+                "compile",
+                "style",
+                "test"
+            ],
+            "timeout": 600
+        },
+        "clean": {
+            "description": "remove build output, the egg-info, Python caches and tmp/ (logs included)",
+            "command": [
+                "rm",
+                "-rf",
+                "agent_tools.egg-info",
+                "build",
+                "gci/__pycache__",
+                "gci/tools/__pycache__",
+                "tests/__pycache__",
+                "tmp"
+            ]
+        },
+        "compile": {
+            "description": "byte-compile every module, a second's check that each one parses",
+            "command": [
+                "{python}",
+                "-m",
+                "compileall",
+                "-q",
+                "gci",
+                "tests"
+            ]
+        },
+        "package": {
+            "description": "build the wheel into tmp/wheel to check pyproject.toml packages every module (needs setuptools installed; leaves build/ for clean)",
+            "command": [
+                "{python}",
+                "-m",
+                "pip",
+                "wheel",
+                ".",
+                "--no-deps",
+                "--no-build-isolation",
+                "-q",
+                "-w",
+                "{tmp}/wheel"
+            ]
+        },
+        "style": {
+            "description": "house rules no linter checks: en-US spelling, no em dashes, no decorative comment lines, ROOT read as core.ROOT",
+            "files": [
+                "*.py",
+                "*.toml",
+                "*.sh",
+                "*.yml",
+                "*.yaml"
+            ],
+            "forbid": [
+                {
+                    "message": "em dash",
+                    "pattern": "\u2014"
+                },
+                {
+                    "message": "decorative comment line",
+                    "pattern": "^\\s*(?://|#|--)\\s*(?:.{0,40}[\u2500\u2501\u2550]{3}|[-=*~_]{8}|[-=*~_]{3,}\\s.*\\s[-=*~_]{3,}\\s*$)"
+                },
+                {
+                    "message": "en-GB spelling",
+                    "pattern": "(?<![A-Za-z])(?![A-Z]+(?![A-Za-z]))(?i:colour[a-z]*|behaviour[a-z]*|neighbour[a-z]*|favour[a-z]*|honour[a-z]*|flavour[a-z]*|centre[sd]?|centring|grey(?:s|scale)?|catalogue[sd]?|(?:milli|centi|kilo)?metres?|litres?|licence[sd]?|defence|offence|travell[a-z]+|cancell(?:ed|ing)|modell(?:ed|ing|er)|labell(?:ed|ing)|signall(?:ed|ing)|fulfil|enrol|programme|[a-z]*(?:normalis|serialis|deserialis|initialis|optimis|organis|recognis|realis|minimis|maximis|visualis|synchronis|customis|specialis|utilis|finalis|parallelis|summaris|prioritis|categoris|authoris|materialis|tokenis|randomis|stabilis|equalis|generalis|localis|quantis|rasteris|vectoris|virtualis|discretis|linearis|sanitis|analys)(?:e|es|ed|er|ers|ing|ation|ations|able))(?![A-Za-z])"
+                },
+                {
+                    "message": "ROOT imported by name (read core.ROOT, so tests can repoint it)",
+                    "pattern": "from\\s+\\.+core\\s+import\\s+(?:\\([^)]*|[^\\n]*)\\bROOT\\b"
+                }
+            ]
+        },
+        "test": {
+            "description": "the unit tests; args: test modules or names to run alone, e.g. tests.test_files",
+            "args": true,
+            "command": [
+                "{python}",
+                "-m",
+                "unittest"
+            ],
+            "timeout": 600
+        },
+        "tools": {
+            "description": "the tool list as a client sees it; args: --brief, --json, tool names",
+            "args": true,
+            "command": [
+                "{python}",
+                "-m",
+                "gci",
+                "tools"
+            ]
+        }
+    }
+}

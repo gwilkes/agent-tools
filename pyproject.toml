@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-tools"
-version = "0.1.1"
-description = "Shell-free file, search and script tools for coding agents over MCP, with remote hosts."
+version = "0.1.2"
+description = "Script and file tools for coding agents over MCP, with remote hosts."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -15,3 +15,6 @@ gci = "gci.cli:run"
 
 [tool.setuptools]
 packages = ["gci", "gci.tools"]
+
+[tool.setuptools.package-data]
+gci = ["settings.schema.json"]

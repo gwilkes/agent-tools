@@ -1,15 +1,19 @@
-"""The settings' scripts: turning an entry into a plan, and running a plan.
+"""The settings' scripts: describing them, and turning an entry into a plan to run.
 
 An entry is one of four kinds, by the key it has:
 
-    "command": [...]        one argv
-    "steps":   [[...], ...] argvs run in order; the first failure stops it
-    "run":     ["a", ...]   a gauntlet: other scripts in order, OK/FAIL each
-    "forbid":  [{...}, ...] regex rules no file in the tree may break
+    "command":  [...]        one argv
+    "commands": [[...], ...] argvs run in order; the first failure stops it
+    "run":      ["a", ...]   a gauntlet: other scripts in order, OK/FAIL each
+    "forbid":   [{...}, ...] regex rules no file in the tree may break
 
 and may also carry `description`, `args` (whether callers may add
-arguments), `timeout`, `cwd`, `env`, `path` and `platforms`. Settings-wide
-`env`, `path`, `timeout` and `vars` apply to every script.
+arguments), `cwd`, `env`, `path` and `platforms`, plus the DEFAULT_KEYS:
+`timeout`, and run_script's own `hosts`, `sync`, `wait`, `grep`, `after` and
+`tail`, for whatever a caller leaves out (a gauntlet's members use only their
+timeout). The settings' `defaults` holds the same keys for every script; a
+script's own key wins, null included, so a script can clear a shared default.
+Settings-wide `env`, `path` and `vars` apply to every script, beneath its own.
 
 `{name}` anywhere in an argument, cwd or env value is a var: the settings'
 `vars` (a string, or a map from platform to string with an optional
@@ -17,28 +21,50 @@ arguments), `timeout`, `cwd`, `env`, `path` and `platforms`. Settings-wide
 python, exe (".exe" on Windows, else ""), tmp, root, platform, home. An
 unknown name is left as it is, so JSON or a cargo `--config` in an argument
 survives. An argument that is exactly `{args}` is where a caller's arguments
-go; without one they follow the last step.
+go; without one they follow the last command.
 """
 
+import json
 import os
 import re
 import shlex
 import sys
-import time
 from pathlib import Path
+from typing import Union
 
 from . import core
 from .core import (
     DEFAULT_TIMEOUT,
     Rules,
     ToolError,
-    describe_scripts,
     resolve,
     tmp_rel,
 )
-from .sync import sync_ignore, sync_walk
+from .listing import block, listing
+from .wire import describe_hosts, host_map
 
-KINDS = ("command", "steps", "run", "forbid")
+KINDS = ("command", "commands", "run", "forbid")
+# Keys an older settings file used, and what a refusal tells its author.
+RETIRED = {"steps": 'is now "commands"'}
+# What a script, or the settings' `defaults` for every script, can set for
+# the caller who leaves it out.
+DEFAULT_KEYS = ("hosts", "sync", "wait", "grep", "after", "tail", "timeout")
+# Every key a script may have, and the settings around it; settings.schema.json
+# describes each, and a test holds the two together. A key outside these is a
+# typo, refused rather than quietly ignored.
+SCRIPT_KEYS = {
+    *KINDS,
+    *DEFAULT_KEYS,
+    *("description", "args", "cwd", "env", "path", "platforms"),
+    *("keep_going", "files", "exclude"),
+}
+SETTINGS_KEYS = {
+    *("$schema", "deny", "protect", "skip", "tmp", "max_output", "edit_self"),
+    *("vars", "env", "path", "defaults", "scripts", "remote"),
+}
+# A plan's kind for a `run` entry. The settings key stays "run", the word a
+# person writes; inside, a gauntlet is kept apart from the many other runs.
+GAUNTLET = "gauntlet"
 ARGS_TOKEN = "{args}"
 VAR = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # Platform names a person writes, mapped onto sys.platform's.
@@ -48,19 +74,171 @@ PLATFORM_ALIASES = {
     "windows": "win32",
     "win": "win32",
 }
-# What a plan answers when it was killed rather than exiting, as a shell would.
-KILLED_EXIT = 137
+
+
+def describe_script(entry: dict) -> str:
+    """What a script does, in a few words: its commands, the scripts a
+    gauntlet runs, or how many rules a check holds."""
+    if not isinstance(entry, dict):
+        return "(not an object)"
+
+    def argv(command):
+        return shlex.join(command) if isinstance(command, list) else repr(command)
+
+    if "run" in entry:
+        what = f"runs {', '.join(map(str, entry['run']))}"
+    elif "forbid" in entry:
+        what = f"checks {len(entry['forbid'])} rule(s) over the tree"
+    elif isinstance(entry.get("commands"), list):
+        what = " && ".join(f"`{argv(c)}`" for c in entry["commands"])
+    else:
+        what = f"`{argv(entry.get('command', []))}`"
+    if entry.get("args"):
+        what += " [args...]"
+    if entry.get("platforms"):
+        what += f" ({', '.join(entry['platforms'])} only)"
+    defaults = describe_defaults(entry)
+    if defaults:
+        what += f" (default {defaults})"
+    return what
+
+
+def describe_defaults(given: dict) -> str:
+    """The DEFAULT_KEYS `given` sets, as `wait 5, grep 'x'`; a null as `none`."""
+
+    def shown(key, value):
+        if value is None:
+            return "none"
+        if key == "grep":
+            return repr(value)
+        if key == "hosts" and isinstance(value, list):
+            return ", ".join(map(str, value))
+        return json.dumps(value) if isinstance(value, bool) else str(value)
+
+    return ", ".join(
+        f"{key} {shown(key, given[key])}" for key in DEFAULT_KEYS if key in given
+    )
+
+
+def describe_scripts(cfg: dict) -> str:
+    scripts = cfg.get("scripts") or {}
+    if not scripts:
+        return "  (none)"
+    rows = []
+    for name, entry in sorted(scripts.items()):
+        desc = entry.get("description") if isinstance(entry, dict) else ""
+        rows.append(
+            f"  {name}: {desc + ' -- ' if desc else ''}{describe_script(entry)}"
+        )
+    return "\n".join(rows)
+
+
+def scripts_and_hosts(cfg: dict) -> str:
+    """The listing the scripts tool answers with."""
+    shared = cfg.get("defaults")
+    head = (
+        f"defaults for every script: {describe_defaults(shared)}\n"
+        if isinstance(shared, dict) and describe_defaults(shared)
+        else ""
+    )
+    return f"{head}scripts:\n{describe_scripts(cfg)}\nhosts:\n{describe_hosts(cfg)}"
+
+
+# A word shlex would quote only for its braces, which a var needs and a shell
+# reader does not mind.
+PLAIN_WORD = re.compile(r"[\w@%+=:,./{}-]+")
+
+
+def shown_argv(argv: object) -> str:
+    if not isinstance(argv, list):
+        return repr(argv)
+    return " ".join(
+        a if isinstance(a, str) and PLAIN_WORD.fullmatch(a) else shlex.quote(str(a))
+        for a in argv
+    )
+
+
+def script_rows(cfg: dict, name: str, entry: dict) -> list[tuple[str, str]]:
+    """What a script runs, where, and every default it runs with, each
+    marked with where it comes from when that is not the script itself."""
+    rows = []
+    if "run" in entry:
+        rows.append(("runs", ", ".join(map(str, entry["run"]))))
+        if entry.get("keep_going"):
+            rows.append(("keep_going", "true: every member runs, failed or not"))
+    elif "forbid" in entry:
+        rules = entry["forbid"] if isinstance(entry["forbid"], list) else []
+        rows.append(("checks", f"{len(rules)} rule(s) over the files a sync carries"))
+        if entry.get("files"):
+            rows.append(("files", ", ".join(entry["files"])))
+        if entry.get("exclude"):
+            rows.append(("exclude", ", ".join(entry["exclude"])))
+    else:
+        commands = entry.get("commands")
+        if not isinstance(commands, list):
+            commands = [entry.get("command")]
+        rows += [("$", shown_argv(c)) for c in commands]
+    for key in ("cwd", "platforms"):
+        if entry.get(key):
+            value = entry[key]
+            rows.append((key, ", ".join(value) if isinstance(value, list) else value))
+    try:
+        defaults = script_defaults(cfg, name)
+    except ToolError as e:
+        return [*rows, ("defaults", f"unreadable: {e}")]
+    defaults.setdefault("timeout", DEFAULT_TIMEOUT)
+    for key in DEFAULT_KEYS:
+        if key not in defaults:
+            continue
+        where = (
+            ""
+            if key in entry
+            else (
+                "  (from defaults)"
+                if key in (cfg.get("defaults") or {})
+                else "  (built in)"
+            )
+        )
+        rows.append(
+            (key, describe_defaults({key: defaults[key]}).split(" ", 1)[1] + where)
+        )
+    return rows
+
+
+def script_listing(cfg: dict) -> str:
+    """The scripts and hosts as `gci scripts` prints them: a block each."""
+    blocks = []
+    for name, entry in sorted((cfg.get("scripts") or {}).items()):
+        if not isinstance(entry, dict):
+            blocks.append(block(name, "(not an object)", []))
+            continue
+        head = f"{name} [ARGS...]" if entry.get("args") else name
+        blocks.append(
+            block(head, entry.get("description"), script_rows(cfg, name, entry))
+        )
+    if not blocks:
+        blocks.append(block("(no scripts)", "the settings' scripts name them", []))
+    hosts = host_map(cfg)
+    rows = [(h, str(addr)) for h, addr in hosts.items()]
+    blocks.append(
+        block(
+            "hosts",
+            None if rows else "none: the settings' remote.hosts name them",
+            rows,
+        )
+    )
+    return listing(blocks)
 
 
 class WrongPlatform(ToolError):
     """A script this host does not run. A gauntlet skips one; a direct call refuses."""
 
 
-def on_platform(name):
+def on_platform(name: str) -> bool:
     return sys.platform.startswith(PLATFORM_ALIASES.get(name, name))
 
 
-def var_values(cfg):
+def var_values(cfg: dict) -> dict[str, str]:
     values = {
         "python": sys.executable,
         "exe": ".exe" if os.name == "nt" else "",
@@ -85,11 +263,11 @@ def var_values(cfg):
     return values
 
 
-def substitute(text, values):
+def substitute(text: str, values: dict[str, str]) -> str:
     return VAR.sub(lambda m: values.get(m.group(1), m.group(0)), text)
 
 
-def argv_list(value, where):
+def argv_list(value: object, where: str) -> list[str]:
     if not (
         isinstance(value, list) and value and all(isinstance(a, str) for a in value)
     ):
@@ -98,29 +276,61 @@ def argv_list(value, where):
 
 
 class Plan:
-    """A script resolved for this host: what to run, where, with what."""
+    """A script resolved for this host: what to run, where, with what.
 
-    def __init__(self, name, kind, cfg):
+    Every kind has a name, a kind and a timeout. The rest belongs to one kind
+    each, and stays empty for the others: `commands`, `cwd` and `env` to
+    commands; `members` and `keep_going` to a gauntlet; `rules`, `files`,
+    `exclude` and `cfg` to forbid, which walks the tree as a sync would.
+    """
+
+    name: str
+    # "commands" (a "command" entry too), GAUNTLET or "forbid".
+    kind: str
+    cfg: dict
+    commands: list[list[str]]
+    # (member name, its plan, or why it is skipped on this host).
+    members: list[tuple[str, Union["Plan", str]]]
+    # (pattern, the message for a match).
+    rules: list[tuple[re.Pattern, str]]
+    cwd: Path
+    env: dict[str, str] | None
+    timeout: float | None
+    keep_going: bool
+    files: list[str]
+    exclude: list[str]
+
+    def __init__(self, name: str, kind: str, cfg: dict):
         self.name, self.kind, self.cfg = name, kind, cfg
-        self.steps, self.members, self.rules = [], [], []
+        self.commands, self.members, self.rules = [], [], []
         self.cwd, self.env, self.timeout = core.ROOT, None, DEFAULT_TIMEOUT
         self.keep_going = False
         self.files, self.exclude = [], []
 
 
-def script_plan(cfg, name, args, nested=False):
-    """The Plan for script `name` with caller `args`, or a ToolError saying why not."""
+def script_entry(cfg: dict, name: str) -> dict | None:
+    """Script `name`'s entry in the settings, or None if there is no such script."""
     entry = (cfg.get("scripts") or {}).get(name)
-    if not isinstance(entry, dict):
+    return entry if isinstance(entry, dict) else None
+
+
+def script_plan(cfg: dict, name: str, args: list[str], nested: bool = False) -> Plan:
+    """The Plan for script `name` with caller `args`, or a ToolError saying why not."""
+    entry = script_entry(cfg, name)
+    if entry is None:
         raise ToolError(
             f"no script {name!r}; the scripts are:\n{describe_scripts(cfg)}"
         )
+    refuse_unknown(f"script {name!r}", entry, SCRIPT_KEYS)
     platforms = entry.get("platforms")
     if platforms and not any(on_platform(p) for p in platforms):
         raise WrongPlatform(
             f"script {name!r} runs only on {', '.join(platforms)}; "
             f"this host is {sys.platform}"
         )
+    retired = [k for k in RETIRED if k in entry]
+    if retired:
+        raise ToolError(f"script {name!r}: {retired[0]!r} {RETIRED[retired[0]]}")
     kinds = [k for k in KINDS if k in entry]
     if len(kinds) != 1:
         raise ToolError(
@@ -128,13 +338,14 @@ def script_plan(cfg, name, args, nested=False):
             f"it has {', '.join(kinds) or 'none'}"
         )
     args = list(args or [])
-    if args and not entry.get("args"):
+    if args and (not entry.get("args") or kinds[0] in ("run", "forbid")):
         raise ToolError(f"script {name!r} takes no arguments")
-    plan = Plan(name, kinds[0], cfg)
+    kind = {"run": GAUNTLET, "command": "commands"}.get(kinds[0], kinds[0])
+    plan = Plan(name, kind, cfg)
     values = var_values(cfg)
-    plan.timeout = entry.get("timeout", cfg.get("timeout", DEFAULT_TIMEOUT))
+    plan.timeout = script_timeout(name, cfg)
 
-    if plan.kind == "run":
+    if plan.kind == GAUNTLET:
         if nested:
             raise ToolError(
                 f"script {name!r} is a gauntlet; a gauntlet cannot run another"
@@ -162,27 +373,68 @@ def script_plan(cfg, name, args, nested=False):
         plan.exclude = list(entry.get("exclude", []))
         return plan
 
-    steps = [entry["command"]] if plan.kind == "command" else entry["steps"]
-    if not (isinstance(steps, list) and steps):
-        raise ToolError(f"script {name!r}: steps must be a non-empty list of argvs")
+    commands = [entry["command"]] if "command" in entry else entry["commands"]
+    if not (isinstance(commands, list) and commands):
+        raise ToolError(f"script {name!r}: commands must be a non-empty list of argvs")
     spliced = False
-    for i, step in enumerate(steps):
+    for i, command in enumerate(commands):
         out = []
-        for arg in argv_list(step, f"script {name!r} step {i + 1}"):
+        for arg in argv_list(command, f"script {name!r} command {i + 1}"):
             if arg == ARGS_TOKEN:
                 out += args
                 spliced = True
             else:
                 out.append(substitute(arg, values))
-        plan.steps.append(out)
+        plan.commands.append(out)
     if not spliced:
-        plan.steps[-1] += args
+        plan.commands[-1] += args
     plan.cwd = resolve(substitute(entry.get("cwd", "."), values), Rules(cfg))
     plan.env = script_env(cfg, entry, values)
     return plan
 
 
-def script_env(cfg, entry, values):
+def script_defaults(cfg: dict, name: str) -> dict:
+    """The DEFAULT_KEYS script `name` sets: its own, else the settings'
+    `defaults`. A key neither sets is absent, so a null that clears one is
+    told apart from nothing said. Each is checked only where it is used."""
+    if "timeout" in cfg:
+        raise ToolError('the settings\' "timeout" is now "defaults": {"timeout": N}')
+    refuse_unknown("the settings", cfg, SETTINGS_KEYS)
+    shared = cfg.get("defaults", {})
+    if not isinstance(shared, dict):
+        raise ToolError('the settings\' "defaults" must be an object')
+    refuse_unknown('the settings\' "defaults"', shared, DEFAULT_KEYS)
+    entry = script_entry(cfg, name) or {}
+    return {
+        k: entry[k] if k in entry else shared[k]
+        for k in DEFAULT_KEYS
+        if k in entry or k in shared
+    }
+
+
+def refuse_unknown(where: str, given: dict, known) -> None:
+    unknown = sorted(set(given) - set(known) - set(RETIRED))
+    if unknown:
+        raise ToolError(
+            f"{where}: unknown key(s) {', '.join(unknown)}; "
+            f"known: {', '.join(sorted(known))}"
+        )
+
+
+def script_timeout(name: str, cfg: dict) -> float | None:
+    """The script's own timeout, else the settings' default, else
+    DEFAULT_TIMEOUT; null or 0 for none."""
+    timeout = script_defaults(cfg, name).get("timeout", DEFAULT_TIMEOUT)
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+    ):
+        raise ToolError(
+            f"script {name!r}: timeout must be a number of seconds, not {timeout!r}"
+        )
+    return timeout or None
+
+
+def script_env(cfg: dict, entry: dict, values: dict[str, str]) -> dict[str, str]:
     """The environment a script runs with: this one, its `path` entries put
     ahead of PATH, and its `env` set; the settings' own first, the script's after."""
     env = dict(os.environ)
@@ -196,99 +448,3 @@ def script_env(cfg, entry, values):
         for key, value in source.items():
             env[str(key)] = substitute(str(value), values)
     return env
-
-
-# ---- running ----
-
-
-def elapsed(seconds):
-    seconds = int(seconds)
-    return f"{seconds // 60}:{seconds % 60:02d}"
-
-
-def run_plan(plan, emit, stop, quiet=None):
-    """Run a plan, handing `emit` its output. Its exit code, or KILLED_EXIT.
-    `quiet` gets the output a gauntlet's members print, which `emit` does not."""
-    if plan.kind == "run":
-        return run_gauntlet(plan, emit, stop, quiet)
-    if plan.kind == "forbid":
-        return run_forbid(plan, emit)
-    from .procs import stream_command  # here, since procs imports this module
-
-    deadline = time.monotonic() + plan.timeout if plan.timeout else None
-    for step in plan.steps:
-        emit(f"$ {shlex.join(step)}")
-        left = max(deadline - time.monotonic(), 1) if deadline else None
-        code, why = stream_command(step, plan.cwd, left, emit, stop, env=plan.env)
-        if why is not None:
-            emit(
-                why if "timeout" not in why else f"killed after {plan.timeout}s timeout"
-            )
-            return KILLED_EXIT
-        if code != 0:
-            return code
-    return 0
-
-
-def run_gauntlet(plan, emit, stop, quiet=None):
-    """Each member in order, one line apiece; a failure's own output under its line.
-    A member's output goes to `quiet` as it lands, so it can be watched live."""
-    started = time.monotonic()
-    failed = 0
-    ran = 0
-    for member, sub in plan.members:
-        if isinstance(sub, str):
-            emit(f"  SKIP  {member:<16} {sub}")
-            continue
-        lines = []
-
-        def member_out(line, lines=lines):
-            lines.append(line)
-            if quiet:
-                quiet(line)
-
-        if quiet:
-            quiet(f"--- {member}")
-        began = time.monotonic()
-        code = run_plan(sub, member_out, stop)
-        word = "OK" if code == 0 else ("KILLED" if code == KILLED_EXIT else "FAIL")
-        emit(f"  {word:<5} {member:<16} {elapsed(time.monotonic() - began)}")
-        ran += 1
-        if code == 0:
-            continue
-        # The tail, because the end of a failed build is where its error is.
-        for line in lines[-150:]:
-            emit(f"        {line}")
-        failed = failed or code
-        if code == KILLED_EXIT or not plan.keep_going:
-            emit(f"FAILED at {member} after {elapsed(time.monotonic() - started)}")
-            return code
-    took = elapsed(time.monotonic() - started)
-    emit(f"{'some FAILED' if failed else f'all {ran} OK'} in {took}")
-    return failed
-
-
-def run_forbid(plan, emit):
-    """Every break of the plan's rules in the files a sync would carry."""
-    rules = Rules(plan.cfg)
-    files, _ = sync_walk(rules, sync_ignore(plan.cfg))
-    issues, scanned = 0, 0
-    for rel in files:
-        if plan.files and not core.any_match(rel, plan.files):
-            continue
-        if core.any_match(rel, plan.exclude):
-            continue
-        text = core.read_text(core.ROOT / rel)
-        if text is None:
-            continue
-        scanned += 1
-        found = []
-        for rx, message in plan.rules:
-            for match in rx.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
-                found.append((line, f"{message}: `{match.group(0).strip()[:60]}`"))
-        for line, problem in sorted(found):
-            emit(f"{rel}:{line}: {problem}")
-        issues += len(found)
-    emit(f"{issues} issue(s) in {scanned} file(s)")
-    return 1 if issues else 0

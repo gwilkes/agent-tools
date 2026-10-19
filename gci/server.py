@@ -1,39 +1,51 @@
 """`gci serve`: what each host runs, so other machines can sync to it and run
-its .gci/settings.json scripts as jobs they follow."""
+its settings' scripts as jobs they follow.
+
+A request that changes the tree or runs a script reads the settings strictly:
+if they cannot be read, it is refused rather than run under default rules.
+Only /info, which changes nothing, carries on without them."""
 
 import hmac
-import io
 import json
 import os
 import shlex
 import sys
-import tarfile
 import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from . import core
-from .core import VERSION, Rules, ToolError, safe_config
-from .procs import local_script
+from .core import VERSION, Rules, ToolError, config, rel_of, safe_config
+from .procs import INTERNAL_ERROR, local_script
 from .scripts import script_plan
 from .sync import (
     file_hash,
     prune_empty_parents,
     sync_ignore,
     sync_walk,
+    unpack,
     unpack_sources,
     wire_target,
 )
+from .text import write_bytes
+from .wire import (
+    FILES,
+    INFO,
+    JOB,
+    JOB_POLL,
+    KEY_HEADER,
+    KILL,
+    MANIFEST,
+    SCRIPT,
+    SELF_UPDATE,
+    USER_AGENT,
+    VERSION_HEADER,
+    api_key,
+    missing_key,
+)
 
-KEY_HEADER = "X-GCI-Key"
-VERSION_HEADER = "X-GCI-Version"
-# Marks a job line that is for watching, not for the run's result.
-LIVE_PREFIX = "##gci-live "
-# Cloudflare's browser integrity check refuses a request that names no agent.
-USER_AGENT = "agent-tools"
-# How long a /job poll waits for a line before answering with none.
-JOB_POLL = 25
 # A job nobody has polled for this long is killed; its client is gone.
 JOB_ABANDON = 600
 # A finished job's output is kept this long for a client still catching up.
@@ -48,28 +60,30 @@ class Job:
     last one ended.
     """
 
-    def __init__(self, label):
+    def __init__(self, label: str):
         self.id = os.urandom(8).hex()
         self.label = label
-        self.lines = []
-        self.code = None
-        self.finished_at = None
+        # [text, quiet] pairs, as /job hands them out.
+        self.lines: list[list] = []
+        self.code: int | None = None
+        self.finished_at: float | None = None
         self.last_read = time.monotonic()
-        self.stop_reason = None
+        self.stop_why: str | None = None
         self._cond = threading.Condition()
 
-    def append(self, line):
+    def append(self, line: str, quiet: bool = False) -> None:
+        """A line of the job's output; `quiet` for one only a watcher wants."""
         with self._cond:
-            self.lines.append(line)
+            self.lines.append([line, quiet])
             self._cond.notify_all()
 
-    def finish(self, code):
+    def finish(self, code: int) -> None:
         with self._cond:
             self.code = code
             self.finished_at = time.monotonic()
             self._cond.notify_all()
 
-    def read(self, start, wait):
+    def read(self, start: int, wait: float) -> tuple[list[list], int | None]:
         """The lines from `start` on, waiting up to `wait` for one, and the
         exit code once there is one."""
         with self._cond:
@@ -80,37 +94,74 @@ class Job:
             self.last_read = time.monotonic()
             return self.lines[start:], self.code
 
-    def stop(self, reason):
-        self.stop_reason = self.stop_reason or reason
+    def stop(self, reason: str) -> None:
+        self.stop_why = self.stop_why or reason
 
-    def should_stop(self):
-        """What the running step polls: a kill, or a caller that went away."""
-        if self.stop_reason is None and time.monotonic() - self.last_read > JOB_ABANDON:
+    def poll_stop(self) -> str | None:
+        """What the running step polls: why to stop, a kill or a caller that
+        went away, or None to carry on. Polling is what notices the caller
+        going away, and stops the job then."""
+        if self.stop_why is None and time.monotonic() - self.last_read > JOB_ABANDON:
             self.stop(f"killed: nobody polled for {JOB_ABANDON}s")
-        return self.stop_reason
+        return self.stop_why
 
-    def expired(self, now):
+    def expired(self, now: float) -> bool:
         return self.finished_at is not None and now - self.finished_at > JOB_KEEP
 
 
-def install_sources(sources):
+def own_module(own: str | None, rel: str) -> bool:
+    """Whether `rel` is one of this server's own modules, which are
+    /self-update's to change and never a sync's, whether writing or deleting."""
+    return own is not None and rel.startswith(own + "/")
+
+
+def install_sources(sources: dict[str, bytes]) -> None:
     """Make the package directory hold exactly `sources`: every module written,
-    and any module the new version no longer has removed."""
-    for rel, data in sources.items():
-        target = core.PKG_DIR / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-    for rel in core.package_sources():
-        if rel not in sources:
-            (core.PKG_DIR / rel).unlink()
+    and any module the new version no longer has removed. All or nothing: a
+    failure partway puts the old package back, since a server that execs a
+    mix of two versions may not come back."""
+    old = core.package_sources()
+    try:
+        for rel, data in sources.items():
+            write_bytes(core.PKG_DIR / rel, data)
+        for rel in old:
+            if rel not in sources:
+                (core.PKG_DIR / rel).unlink()
+    except OSError as e:
+        stuck = []
+        for rel in sorted(set(old) | set(sources)):
+            target = core.PKG_DIR / rel
+            try:
+                if rel in old:
+                    write_bytes(target, old[rel])
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:
+                stuck.append(rel)
+        restored = (
+            f"these could not be put back: {' '.join(stuck)}"
+            if stuck
+            else "the old package was put back"
+        )
+        raise ToolError(f"installing failed ({e}); {restored}") from None
 
 
-class CiHandler(BaseHTTPRequestHandler):
+def wire_path(rel: object, rules: Rules) -> Path:
+    """The tree path a sync may write or compare for a name from the wire, or
+    a ToolError. The deny list is checked against where the name leads too,
+    so a host's symlink cannot carry a write onto a denied file."""
+    target = wire_target(rel)
+    if target is None or rules.denied(rel) or rules.denied(rel_of(target)):
+        raise ToolError(f"bad path: {rel}")
+    return target
+
+
+class HostHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = USER_AGENT
 
     def log_message(self, fmt, *args):
-        pass
+        """Silent: slog writes one line per request, with its outcome."""
 
     def log_error(self, fmt, *args):
         self.slog("error", fmt % args)
@@ -157,9 +208,22 @@ class CiHandler(BaseHTTPRequestHandler):
         self._json(code, {"error": error})
         self.slog(verb, detail, f"REFUSED {error}", started)
 
+    def _json_body(self) -> dict:
+        """The request body as a JSON object, or a ToolError, which answers 400."""
+        try:
+            payload = json.loads(self._body() or b"{}")
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            raise ToolError("the request body must be a JSON object")
+        return payload
+
     def _dispatch(self, routes):
+        """Each route is (handler, needs_parity, locked): whether the client
+        must run this version, and whether the request holds the run lock."""
         started = time.monotonic()
         url = urllib.parse.urlsplit(self.path)
+        verb = url.path.lstrip("/")
         if not hmac.compare_digest(
             self.headers.get(KEY_HEADER, "").encode(), self.server.key.encode()
         ):
@@ -171,7 +235,7 @@ class CiHandler(BaseHTTPRequestHandler):
         if route is None:
             self._refuse(404, "unknown endpoint", self.command, url.path, started)
             return
-        handler, needs_parity = route
+        handler, needs_parity, locked = route
         theirs = self.headers.get(VERSION_HEADER, "")
         # Two versions can disagree about the sync domain, and a sync across
         # that disagreement deletes what the other side still wants.
@@ -179,39 +243,48 @@ class CiHandler(BaseHTTPRequestHandler):
             self._refuse(
                 412,
                 f"version skew: server runs {VERSION}, client {theirs or '(none)'}",
-                url.path.lstrip("/"),
+                verb,
                 "",
                 started,
             )
             return
+        if locked and not self._try_lock(verb, "", started):
+            return
         try:
             handler(urllib.parse.parse_qs(url.query), started)
+        except ToolError as e:
+            self._refuse(400, str(e), verb, "", started)
         except Exception as e:  # one bad request must not take the server down
             self._json(500, {"error": f"{type(e).__name__}: {e}"})
-            self.slog(
-                url.path.lstrip("/"), f"{type(e).__name__}: {e}", "FAILED", started
-            )
+            self.slog(verb, f"{type(e).__name__}: {e}", "FAILED", started)
+        finally:
+            if locked:
+                self.server.run_lock.release()
 
     def do_GET(self):
         self._dispatch(
-            {"/info": (self.handle_info, False), "/job": (self.handle_job, False)}
+            {
+                INFO: (self.handle_info, False, False),
+                JOB: (self.handle_job, False, False),
+            }
         )
 
     def do_POST(self):
         # /self-update and /kill skip the parity check: converging is the one
         # cross-version operation, and a kill must reach a run of any version.
+        # /script takes the run lock itself, since its job holds it after the reply.
         self._dispatch(
             {
-                "/self-update": (self.handle_self_update, False),
-                "/kill": (self.handle_kill, False),
-                "/manifest": (self.handle_manifest, True),
-                "/files": (self.handle_files, True),
-                "/script": (self.handle_script, True),
+                SELF_UPDATE: (self.handle_self_update, False, True),
+                KILL: (self.handle_kill, False, False),
+                MANIFEST: (self.handle_manifest, True, True),
+                FILES: (self.handle_files, True, True),
+                SCRIPT: (self.handle_script, True, False),
             }
         )
 
     def handle_info(self, query, started):
-        running = self.server.running
+        job = self.server.current_job
         self._json(
             200,
             {
@@ -219,7 +292,7 @@ class CiHandler(BaseHTTPRequestHandler):
                 "platform": sys.platform,
                 "root": core.ROOT.name,
                 "pid": os.getpid(),
-                "running": running.label if running else None,
+                "running": job.label if job else None,
                 "scripts": sorted(safe_config().get("scripts") or {}),
             },
         )
@@ -232,85 +305,59 @@ class CiHandler(BaseHTTPRequestHandler):
         try:
             start = max(0, int(query.get("from", ["0"])[0]))
         except ValueError:
-            self._json(400, {"error": "from must be a line index"})
-            return
+            raise ToolError("from must be a line index") from None
         lines, code = job.read(start, JOB_POLL)
         self._json(200, {"lines": lines, "next": start + len(lines), "code": code})
 
-    def _locked(self, verb, started, fn):
-        """Run `fn` under the run lock, or refuse while a job holds it."""
-        if not self.server.run_lock.acquire(blocking=False):
-            running = self.server.running
-            self._refuse(
-                409,
-                f"busy running {running.label if running else 'a job'}",
-                verb,
-                "",
-                started,
-            )
-            return
-        try:
-            fn()
-        finally:
-            self.server.run_lock.release()
+    def _try_lock(self, verb, detail, started):
+        """Take the run lock, or refuse while a job holds it. Whether it was taken."""
+        if self.server.run_lock.acquire(blocking=False):
+            return True
+        job = self.server.current_job
+        label = job.label if job else "a job"
+        self._refuse(409, f"busy running {label}", verb, detail, started)
+        return False
 
     def handle_self_update(self, query, started):
-        def update():
+        sources = unpack_sources(self._body())
+        # A server that execs a broken package does not come back, and it
+        # is on the far end of the network from whoever broke it.
+        for rel, data in sources.items():
             try:
-                sources = unpack_sources(self._body())
-            except ValueError as e:
-                self._refuse(400, str(e), "update", "", started)
-                return
-            # A server that execs a broken package does not come back, and it
-            # is on the far end of the network from whoever broke it.
-            for rel, data in sources.items():
-                try:
-                    compile(data, str(core.PKG_DIR / rel), "exec")
-                except SyntaxError as e:
-                    self._refuse(
-                        400,
-                        f"refusing to install an unparsable {rel}: {e}",
-                        "update",
-                        "",
-                        started,
-                    )
-                    return
-            install_sources(sources)
-            version = core.sources_version(sources)
-            self._json(200, {"version": version, "restarting": True})
-            self.slog(
-                "update",
-                f"{len(sources)} modules -> {version}, restarting",
-                "OK",
-                started,
-            )
-            self.server.restart_soon()
-
-        self._locked("update", started, update)
+                compile(data, str(core.PKG_DIR / rel), "exec")
+            except SyntaxError as e:
+                raise ToolError(
+                    f"refusing to install an unparsable {rel}: {e}"
+                ) from None
+        install_sources(sources)
+        version = core.sources_version(sources)
+        self._json(200, {"version": version, "restarting": True})
+        self.slog(
+            "update", f"{len(sources)} modules -> {version}, restarting", "OK", started
+        )
+        self.server.restart_soon()
 
     def handle_manifest(self, query, started):
-        self._locked("manifest", started, lambda: self._manifest(started))
-
-    def _manifest(self, started):
-        payload = json.loads(self._body())
-        theirs, dry = payload["files"], payload.get("dry", False)
-        rules = Rules(safe_config())
+        payload = self._json_body()
+        theirs, dry = payload.get("files"), bool(payload.get("dry", False))
+        ignore = payload.get("ignore", sync_ignore({}))
+        if not isinstance(theirs, dict) or not isinstance(ignore, list):
+            raise ToolError("a manifest needs files, a map of path to hash")
+        rules = Rules(config())
         # The client's ignore lines, not this host's: they are the domain the
         # client walked, and the difference between the two is what gets deleted.
-        mine, _ = sync_walk(rules, payload.get("ignore", sync_ignore({})))
-        # This server's own modules are /self-update's to change, never a sync's.
+        mine = sync_walk(rules, ignore)
         own = core.own_rel()
         need = []
         for rel, digest in theirs.items():
-            target = wire_target(rel)
-            if target is None or rules.denied(rel):
-                self._refuse(400, f"bad path: {rel}", "manifest", "", started)
-                return
+            target = wire_path(rel, rules)
+            if own_module(own, rel):
+                continue
             if not target.is_file() or file_hash(target) != digest:
                 need.append(rel)
         deleted = []
         for rel in sorted(set(mine) - set(theirs)):
-            if own is not None and rel.startswith(own + "/"):
+            if own_module(own, rel):
                 continue
             if not dry:
                 (core.ROOT / rel).unlink()
@@ -326,56 +373,39 @@ class CiHandler(BaseHTTPRequestHandler):
         )
 
     def handle_files(self, query, started):
-        self._locked("files", started, lambda: self._files(started))
-
-    def _files(self, started):
         body = self._body()
-        rules = Rules(safe_config())
-        written = 0
-        try:
-            with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
-                for member in tar:
-                    if not member.isfile():
-                        continue
-                    target = wire_target(member.name)
-                    if target is None or rules.denied(member.name):
-                        self._refuse(
-                            400, f"bad path: {member.name}", "files", "", started
-                        )
-                        return
-                    # Written fresh, never with the archive's mtime: an old
-                    # mtime hides the change from a build tool.
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(tar.extractfile(member).read())
-                    if member.mode & 0o111 and os.name != "nt":
-                        target.chmod(target.stat().st_mode | 0o111)
-                    written += 1
-        except tarfile.TarError as e:
-            self._refuse(400, f"bad archive: {e}", "files", "", started)
-            return
-        self._json(200, {"written": written})
-        self.slog("files", f"{written} written, {len(body) // 1024} KiB", "OK", started)
+        rules = Rules(config())
+        own = core.own_rel()
+        # Every name is checked before any file is written, so a refused
+        # batch leaves the tree as it was.
+        files = []
+        for rel, data, executable in unpack(body):
+            target = wire_path(rel, rules)
+            if own_module(own, rel) or own_module(own, rel_of(target)):
+                raise ToolError(f"bad path: {rel}")
+            files.append((target, data, executable))
+        for target, data, executable in files:
+            # Written fresh, never with the archive's mtime: an old mtime
+            # hides the change from a build tool.
+            write_bytes(target, data)
+            if executable and os.name != "nt":
+                target.chmod(target.stat().st_mode | 0o111)
+        self._json(200, {"written": len(files)})
+        self.slog(
+            "files", f"{len(files)} written, {len(body) // 1024} KiB", "OK", started
+        )
 
     def handle_script(self, query, started):
-        req = json.loads(self._body())
-        name, args = req.get("script"), [str(a) for a in req.get("args", [])]
-        cfg = safe_config()
-        try:
-            script_plan(cfg, name, args)
-        except ToolError as e:
-            self._refuse(400, str(e), "script", str(name), started)
-            return
+        req = self._json_body()
+        name, args = req.get("script"), req.get("args", [])
+        if not isinstance(name, str) or not isinstance(args, list):
+            raise ToolError("a script request needs script, a name, and args, a list")
+        args = [str(a) for a in args]
+        cfg = config()
+        plan = script_plan(cfg, name, args)
         server = self.server
         label = shlex.join([name, *args])
-        if not server.run_lock.acquire(blocking=False):
-            running = server.running
-            self._refuse(
-                409,
-                f"busy running {running.label if running else 'a job'}",
-                "script",
-                label,
-                started,
-            )
+        if not self._try_lock("script", label, started):
             return
         job = server.add_job(label)
         self.slog("script", f"{label} (job {job.id})")
@@ -385,34 +415,28 @@ class CiHandler(BaseHTTPRequestHandler):
             print(f"{'':25} {line}", flush=True)
 
         def quiet(line):
-            job.append(LIVE_PREFIX + line)
+            job.append(line, quiet=True)
 
         def run():
-            code = 1
+            code = INTERNAL_ERROR
             try:
-                code = local_script(cfg, name, args, emit, job.should_stop, quiet=quiet)
-            except ToolError as e:
-                emit(str(e))
-                code = 127
-            except Exception as e:
-                emit(f"server error: {type(e).__name__}: {e}")
+                code = local_script(cfg, plan, emit, stop=job.poll_stop, quiet=quiet)
             finally:
                 # Free the host before the caller hears the code, so its next request is not refused.
-                server.running = None
+                server.current_job = None
                 server.run_lock.release()
                 job.finish(code)
                 self.slog(
                     "script", label, "OK" if code == 0 else f"exit {code}", started
                 )
 
-        server.running = job
+        server.current_job = job
         threading.Thread(target=run, daemon=True).start()
         self._json(200, {"job": job.id})
 
     def handle_kill(self, query, started):
-        body = self._body()
-        wanted = (json.loads(body) if body else {}).get("job")
-        job = self.server.running
+        wanted = self._json_body().get("job")
+        job = self.server.current_job
         lines = []
         if job is None or wanted not in (None, job.id):
             lines.append("nothing running")
@@ -428,7 +452,7 @@ class CiHandler(BaseHTTPRequestHandler):
         self.slog("kill", "; ".join(lines), "OK", started)
 
 
-class CiServer(ThreadingHTTPServer):
+class HostServer(ThreadingHTTPServer):
     """Windows' SO_REUSEADDR lets a second process bind a port that is still
     listening, so a restart could leave two servers answering; exclusive use
     makes the second bind fail instead."""
@@ -436,10 +460,10 @@ class CiServer(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
 
     def __init__(self, address, key):
-        super().__init__(address, CiHandler)
+        super().__init__(address, HostHandler)
         self.key = key
         self.run_lock = threading.Lock()
-        self.running = None
+        self.current_job: Job | None = None
         self.jobs = {}
         self.restarting = False
         self._jobs_lock = threading.Lock()
@@ -481,16 +505,16 @@ class CiServer(ThreadingHTTPServer):
 
 def serve(port, bind):
     cfg = safe_config()
-    key = core.api_key(cfg)
+    key = api_key(cfg)
     if key is None:
         # This server runs what its settings say, and a sync can rewrite them.
         print(
-            f"gci server: refusing to serve without a key; {core.missing_key(cfg)}",
+            f"gci server: refusing to serve without a key; {missing_key(cfg)}",
             file=sys.stderr,
         )
         return 2
     try:
-        server = CiServer((bind, port), key)
+        server = HostServer((bind, port), key)
     except OSError as e:
         print(
             f"gci server: cannot bind port {port}: {e}; is another gci server still running?",
@@ -513,5 +537,5 @@ def serve(port, bind):
             flush=True,
         )
         # orig_argv keeps `-m gci`, which a rebuilt argv from sys.argv would lose.
-        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])  # nosec B606
     return 0

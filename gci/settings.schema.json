@@ -1,0 +1,283 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://raw.githubusercontent.com/gwilkes/agent-tools/main/gci/settings.schema.json",
+    "title": "gci settings",
+    "description": "The whole of gci's configuration, at .gci/settings.json under the project root. It is read on every call, so an edit lands without a restart.",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "This schema, for an editor's completion and checks. gci ignores it."
+        },
+        "deny": {
+            "$ref": "#/$defs/globs",
+            "description": "What no tool reads, writes or syncs. Not a sandbox: the client's own tools answer to its own permissions, so a file that must stay unread needs the same globs there too.",
+            "default": [".env", ".env.*", "secrets/**"]
+        },
+        "protect": {
+            "$ref": "#/$defs/globs",
+            "description": "What tools may read but never change. .gci/, .mcp.json, .claude/, every .git/ and gci's own package (when it lives in the tree) are always protected, besides these.",
+            "default": []
+        },
+        "skip": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Directory and file names a recursive walk does not enter. A path that names one directly still works.",
+            "default": [".git", "node_modules", "__pycache__", ".venv", "venv", "target", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".DS_Store"]
+        },
+        "tmp": {
+            "type": "string",
+            "description": "The scratch directory, relative to the root: temporary files and run logs (under gci/logs/). It never travels in a sync, and should be in .gitignore.",
+            "default": "tmp"
+        },
+        "max_output": {
+            "type": "integer",
+            "minimum": 1000,
+            "description": "The most characters one tool result may hold. A script's output past it is cut from the middle, keeping more of the end, with a pointer to its log.",
+            "default": 40000
+        },
+        "edit_self": {
+            "type": "boolean",
+            "description": "Lift the protection from gci's own package, for the repo that develops it.",
+            "default": false
+        },
+        "vars": {
+            "type": "object",
+            "description": "Vars every script can use as {name} in an argument, cwd, env or path value, beside the built-ins: python, exe, tmp, root, platform, home. A var may use the built-ins and the vars before it.",
+            "additionalProperties": {
+                "oneOf": [
+                    {"type": "string"},
+                    {
+                        "type": "object",
+                        "description": "A value per platform (macos, windows, linux, or a sys.platform prefix), with an optional \"default\" for the rest.",
+                        "additionalProperties": {"type": "string"}
+                    }
+                ]
+            },
+            "default": {}
+        },
+        "env": {
+            "$ref": "#/$defs/env",
+            "description": "Environment variables set for every script, beneath each script's own."
+        },
+        "path": {
+            "$ref": "#/$defs/path",
+            "description": "Directories put ahead of PATH for every script, after each script's own."
+        },
+        "defaults": {
+            "$ref": "#/$defs/runDefaults",
+            "description": "Defaults for every script, beneath each script's own keys of the same names, for whatever a caller leaves out."
+        },
+        "scripts": {
+            "type": "object",
+            "description": "The scripts run_script can run, by name. Only these run: an agent cannot run a command a person did not write here.",
+            "additionalProperties": {"$ref": "#/$defs/script"},
+            "default": {}
+        },
+        "remote": {"$ref": "#/$defs/remote"}
+    },
+    "$defs": {
+        "globs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Globs: one without a / matches a name at any depth (.env); one with a / the root-relative path (secrets/**, everything under secrets/)."
+        },
+        "argv": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "description": "A program and its arguments, run as given, with no shell (write [\"sh\", \"-c\", \"...\"] for one). An argument that is exactly {args} is where a caller's arguments go."
+        },
+        "env": {
+            "type": "object",
+            "additionalProperties": {"type": ["string", "number", "boolean"]},
+            "default": {}
+        },
+        "path": {
+            "type": "array",
+            "items": {"type": "string"},
+            "default": []
+        },
+        "runDefaults": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "hosts": {"$ref": "#/$defs/defaultHosts"},
+                "sync": {"$ref": "#/$defs/defaultSync"},
+                "wait": {"$ref": "#/$defs/defaultWait"},
+                "grep": {"$ref": "#/$defs/defaultGrep"},
+                "after": {"$ref": "#/$defs/defaultAfter"},
+                "tail": {"$ref": "#/$defs/defaultTail"},
+                "timeout": {"$ref": "#/$defs/defaultTimeout"}
+            }
+        },
+        "defaultHosts": {
+            "type": ["array", "null"],
+            "items": {"type": "string"},
+            "description": "run_script's hosts when the caller gives none: names from remote.hosts, and local for here. Unset, a run is here alone. A caller overrides it with [\"local\"].",
+            "default": null
+        },
+        "defaultSync": {
+            "type": ["boolean", "null"],
+            "description": "Whether run_script syncs this tree to each host before running, when the caller does not say.",
+            "default": true
+        },
+        "defaultWait": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Seconds run_script waits before answering with the output so far and a job id, leaving the run going (MCP only; on the command line a run is waited out). Unset, it waits the run out.",
+            "default": null
+        },
+        "defaultGrep": {
+            "type": ["string", "null"],
+            "description": "A Python regex: run_script's answer keeps only the output lines matching it. The log keeps every line.",
+            "default": null
+        },
+        "defaultAfter": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Lines kept after each grep match, like grep -A: an error's detail.",
+            "default": null
+        },
+        "defaultTail": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Only the last N lines of the output (after grep).",
+            "default": null
+        },
+        "defaultTimeout": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "Seconds before a run is killed with its whole process tree, shared by all of a script's commands. null or 0 for none.",
+            "default": 600
+        },
+        "script": {
+            "type": "object",
+            "description": "A script: exactly one of command, commands, run or forbid. Each run_script default may be set here too, over the settings' defaults; null clears a shared one.",
+            "additionalProperties": false,
+            "oneOf": [
+                {"required": ["command"]},
+                {"required": ["commands"]},
+                {"required": ["run"]},
+                {"required": ["forbid"]}
+            ],
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "What the script is for, as the scripts tool lists it."
+                },
+                "command": {"$ref": "#/$defs/argv", "description": "One argv."},
+                "commands": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/argv"},
+                    "minItems": 1,
+                    "description": "Argvs run in order; the first that fails stops the script."
+                },
+                "run": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "A gauntlet: other scripts by name, run in order with an OK/FAIL line each and the failing one's output, stopping at the first failure unless keep_going. A gauntlet cannot run another, and skips a member for another platform."
+                },
+                "forbid": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/forbidRule"},
+                    "description": "Regex rules checked over the files a sync would carry: a house-style lint with no code."
+                },
+                "args": {
+                    "type": "boolean",
+                    "description": "Whether a caller may add arguments, appended to the last command or put where {args} is. Never for run or forbid.",
+                    "default": false
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Where the commands run, relative to the root.",
+                    "default": "."
+                },
+                "env": {
+                    "$ref": "#/$defs/env",
+                    "description": "Environment variables for this script, over the settings' own."
+                },
+                "path": {
+                    "$ref": "#/$defs/path",
+                    "description": "Directories put ahead of PATH for this script, before the settings' own."
+                },
+                "platforms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The only platforms it runs on: macos, windows, linux, or a sys.platform prefix. Elsewhere a direct call refuses it and a gauntlet skips it."
+                },
+                "keep_going": {
+                    "type": "boolean",
+                    "description": "For run: carry on past a failing member, reporting every one.",
+                    "default": false
+                },
+                "files": {
+                    "$ref": "#/$defs/globs",
+                    "description": "For forbid: only the files matching these."
+                },
+                "exclude": {
+                    "$ref": "#/$defs/globs",
+                    "description": "For forbid: not the files matching these."
+                },
+                "hosts": {"$ref": "#/$defs/defaultHosts"},
+                "sync": {"$ref": "#/$defs/defaultSync"},
+                "wait": {"$ref": "#/$defs/defaultWait"},
+                "grep": {"$ref": "#/$defs/defaultGrep"},
+                "after": {"$ref": "#/$defs/defaultAfter"},
+                "tail": {"$ref": "#/$defs/defaultTail"},
+                "timeout": {"$ref": "#/$defs/defaultTimeout"}
+            }
+        },
+        "forbidRule": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["pattern"],
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "A Python regex, multiline: ^ and $ match at every line."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "What a match is reported as; the pattern itself if unset."
+                }
+            }
+        },
+        "remote": {
+            "type": "object",
+            "description": "Other machines that run the scripts. Files are edited here; each host runs `gci serve` in its own checkout, and a run there syncs this tree to it first.",
+            "additionalProperties": false,
+            "properties": {
+                "hosts": {
+                    "type": "object",
+                    "description": "Host names to addresses (on port) or URLs. An agent reaches only the hosts named here.",
+                    "additionalProperties": {"type": "string"},
+                    "default": {}
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "The port of a host given as an address, and the one `gci serve` listens on.",
+                    "default": 9001
+                },
+                "key_env": {
+                    "type": "string",
+                    "description": "The environment variable holding the shared API key every request carries. The key belongs in neither the settings nor the tree, since both travel.",
+                    "default": "GCI_API_KEY"
+                },
+                "key_file": {
+                    "type": "string",
+                    "description": "The file holding the API key when key_env is unset.",
+                    "default": "~/.gci_key"
+                },
+                "ignore": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lines in gitignore syntax a sync leaves out, after the root .gitignore's.",
+                    "default": []
+                }
+            }
+        }
+    }
+}

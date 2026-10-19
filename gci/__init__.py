@@ -1,41 +1,39 @@
-"""Tools for working in a project, served over MCP: files, search, git and the
-project's own scripts.
+"""Tools for working in a project, from the command line or over MCP: running
+its own scripts, here or on other hosts, and reading and editing its files.
 
-    gci mcp                   serve the tools over stdio (what .mcp.json runs)
-    gci scripts               list the scripts and hosts .gci/settings.json defines
-    gci list-mcp [--json]     every MCP tool, with its description and parameters
-    gci run [--host H ...] [--proxy | --no-proxy] [--no-sync] NAME [ARG ...]
-                              run one of them here, or on each host at once
+    gci TOOL [--PARAM VALUE ...] [--input FILE]
+                              any tool below; `gci TOOL --help` describes it
+    gci run [--host H ...] [--no-sync] NAME [ARG ...]
+                              run a script, its output printed live
     gci serve [--port N] [--bind ADDR]
                               run scripts for remote callers (on each host)
-    gci sync --host H ... [--dry-run]
-                              bring a host's tree level with this one
-    gci hosts                 which hosts answer, and what they run
-    gci kill --host H ...     stop what a host is running
-    gci self-test             drive every tool once in scratch directories
+    gci mcp                   serve the tools over stdio (what .mcp.json runs)
 
 `gci` is the console script `pip install` makes; `python -m gci` is the same
 thing from a checkout.
 
 Each tool has a fixed shape, so what an agent can do is the tool list:
 
-    read edit sub clean_tmp                       (tools/files.py)
-    json                                          (tools/data.py)
-    list_scripts run_script job sync hosts kill   (tools/run.py)
-    self_test restart list_tools                  (mcp.py)
+    read                                          (tools/read.py)
+    edit                                          (tools/files.py)
+    scripts run_script job sync hosts kill        (tools/run.py)
+    tools restart                                 (tools/meta.py)
 
-The bulk forms sit inside two of those rather than beside them, to keep the
-tool list short. `edit` takes several files at once, all or nothing, and
-three kinds of edit: exact text, a line range (which must quote the lines as
-they are now, so a stale line number cannot clobber the wrong ones), and the
-region between two marker lines. `sub` takes one pattern, a list of rules
-applied in order, or a `words` map renaming whole words in one pass.
+Each is a CLI word too, built from its schema: a flag per param, JSON text
+for an object, and `--input` for the whole call as one JSON object. `job`,
+`restart` and run_script's `wait` are not: they need a process that outlives
+the call, and a CLI process ends with it, so a run there is waited out.
 
-There is deliberately no tool that runs arbitrary code. What an agent would
-otherwise write a throwaway script for gets a tool of its own instead: `json`
-for querying and editing JSON, `read` with a negative offset for the end of a
-log, `sub` for editing across files. Anything
-else that needs a process is a script in the settings, where a person wrote it.
+The tools are the ones that save an agent calls or context over its own
+shell. `read` reads a block by its first line (`at`) or several slices at
+once (`ranges`), where a shell would grep for a line number first. `edit`
+takes several files at once, all or nothing, and three kinds of edit: exact
+text, a line range (which must quote the lines as they are now, so a stale
+line number cannot clobber the wrong ones), and the region between two marker
+lines. run_script narrows a build's output before it lands.
+
+There is deliberately no tool that runs arbitrary code. Anything that needs a
+process is a script in the settings, where a person wrote it.
 
 The root is the directory the server starts in (Claude Code starts a project's
 servers in the project), or GCI_ROOT if set. Every path a tool takes is
@@ -43,7 +41,9 @@ relative to it, and one that resolves outside it -- `..`, an absolute path, a
 symlink pointing away -- is refused. Paths in output are root-relative.
 
 .gci/settings.json, under the root, is the whole configuration, and it is read
-on every call, so an edit to it lands without a restart:
+on every call, so an edit to it lands without a restart. settings.schema.json,
+beside this file, describes every key and its default; a key it does not
+list is refused when a script runs, so a typo is never quietly ignored:
 
     {
         "deny":    [".env", ".env.*", "secrets/**"],
@@ -51,6 +51,7 @@ on every call, so an edit to it lands without a restart:
         "skip":    [".git", "node_modules"],
         "tmp":     "tmp",
         "max_output": 40000,
+        "defaults": {"tail": 80, "timeout": 900},
         "scripts": {
             "test": {"description": "run the tests", "command": ["cargo", "test"],
                      "args": true, "timeout": 1200, "cwd": "."}
@@ -74,15 +75,17 @@ that names one directly still works.
 A glob without a `/` matches a name at any depth (`.env`), one with a `/`
 matches the root-relative path (`secrets/**`, everything under secrets/).
 
-A script is an argv: `command` is run as given, with the caller's `args`
-appended only when the entry says `"args": true`, so run_script runs only the
-commands a person wrote. A script that wants a shell says so in the settings (`["sh", "-c", "..."]`), where a person wrote it. Output
-is stdout and stderr together; a run past its `timeout` (600 s unless the
-entry says otherwise) is killed with its whole process tree.
+A script is an argv, `command`, or a list of them, `commands`, run as given
+in order and stopping at the first failure; an entry has one or the other.
+The caller's `args` are appended to the last only when the entry says
+`"args": true`, so run_script runs only the commands a person wrote. A
+script that wants a shell says so in the settings (`["sh", "-c", "..."]`),
+where a person wrote it. Output is stdout and stderr together; a run past
+its `timeout` (600 s unless the settings say otherwise, shared by all its
+commands) is killed with its whole process tree.
 
-Beyond one `command`, an entry can be `steps` (argvs in order, stopping at the
-first failure), `run` (a gauntlet: other scripts in order, an OK/FAIL line
-each and the failing one's output, stopping at the first failure unless
+Instead of either, an entry can be `run` (a gauntlet: other scripts in
+order, an OK/FAIL line each and the failing one's output, stopping at the first failure unless
 `keep_going`), or `forbid` (regex rules checked over the files a sync would
 carry, `files`/`exclude` globs narrowing them -- a house-style lint with no
 code). `{name}` in an argument is a var: the settings' `vars`, which can
@@ -91,10 +94,16 @@ this package, since its name on PATH differs per host), `{exe}` or `{tmp}`.
 `{args}` alone as an argument is where a caller's arguments go. `env`, `path`
 (prepended to PATH) and `platforms` round it out; scripts.py has the details.
 
+`hosts`, `sync`, `wait`, `grep`, `after`, `tail` and `timeout` are defaults,
+for whatever a caller leaves out: the settings' `defaults` sets them for every
+script, and a script's own key of the same name wins, null included, so a
+script can clear a shared grep. `job` reports on a run with its script's grep,
+tail and after unless told otherwise. A caller overrides default hosts with
+`["local"]`, which runs the script here as if no hosts were named.
+
 Temporary files go in tmp/ (or the directory the settings' `tmp` names),
 which should be in .gitignore; that also keeps it out of every sync.
-`clean_tmp` empties it, and refuses when git tracks anything there, since
-then it is not scratch. tmp/ never travels in a sync, whatever .gitignore says.
+tmp/ never travels in a sync, whatever .gitignore says.
 
 A tool result arrives whole when the call ends -- MCP has no streamed result
 -- so a long run is watched two other ways. Every script run writes its
@@ -107,18 +116,29 @@ gauntlet OK/FAIL line among them; whether a client shows those is up to it.
 A gauntlet's result holds its OK/FAIL lines and a failure's tail; its
 members' full output is in the log.
 
+Every run is a job in a thread of the MCP server, so a call need not last as
+long as its run. run_script waits for the run to end unless given `wait`, the
+seconds after which it answers with the output so far and the job's id; `job`
+then reports on the run, waits for it or stops it. A call the client gave up
+on leaves its run to `job` the same way. A restart is refused while a run is
+going, and a client that disconnects stops them all.
+
 A result is at most `max_output` characters (40000 unless the settings say
 otherwise). A script's output past that is cut from the middle, keeping more
 of the end, with a line saying how much went and naming the log that holds
 all of it.
 
-`list_tools` (and `gci list-mcp` from a terminal) is the same list tools/list
-gives a client, laid out for reading: each tool's signature, its description,
-its parameters, and any tools the current settings switch off.
+The `tools` tool is the same list tools/list gives a client, laid out for
+reading: each tool's signature, its description, its parameters, and any
+tools the current settings switch off. `gci tools` and `gci scripts` print
+their lists in a layout of their own for a terminal (listing.py): a block per
+tool or script, its head line, a summary, and aligned rows; a tool's rows are
+its flags and their defaults, a script's are its commands and every default
+it runs with, marked with where each comes from. Their `--grep` keeps whole
+blocks rather than lines.
 
-`self_test` runs `gci self-test` in a fresh process, so it checks the code on
-disk -- run it after an edit to this package, then `restart` to load it.
-`restart` re-execs the MCP server in place -- same pid, same pipes, so the
+After an edit to this package, the tests under tests/ (`python -m unittest`)
+check the code on disk, and `restart` loads it: it re-execs the MCP server in place -- same pid, same pipes, so the
 client sees no disconnect -- after importing every module of the new code in a
 separate process first, so a broken edit leaves the running server alone. It
 re-announces the tool list afterwards.
@@ -128,7 +148,6 @@ of the settings names them:
 
     "remote": {
         "port": 9001,
-        "proxy": "https://example.com/gci",
         "key_env": "GCI_API_KEY",
         "key_file": "~/.gci_key",
         "hosts": {"macos": "192.168.0.24", "windows": "192.168.0.5"},
@@ -138,9 +157,7 @@ of the settings names them:
 Each host runs `gci serve` in its own checkout. run_script with `hosts` reaches
 each one, syncs this tree to it, runs the script there and follows its output,
 all hosts at once; `local` among them runs it here as well. A host is its
-address on `port`, or a URL. Off the home network, `proxy` reaches a named host
-at PROXY/<name>: a direct connection that fails falls back to it unless the
-caller said which to use.
+address on `port`, or a URL.
 
 Every request carries the API key, from the environment variable `key_env`
 names or else from `key_file`, and a server refuses to start without one: it
@@ -164,10 +181,11 @@ for ten minutes is killed.
 A client and a server must run the same code: the version is a hash of every
 module in this package. A client that sees a different one sends its modules
 to /self-update, and the server compiles them all, replaces its own (removing
-any the new version dropped) and restarts into them. A sync never touches the
+any the new version dropped, and putting the old ones back if that fails)
+and restarts into them. A sync never touches the
 server's own package directory; that is /self-update's alone.
 
 Text is read and written as UTF-8 bytes, so line endings and a missing final
 newline survive an edit. A file with a NUL in its first 8 KiB, or that is not
-UTF-8, is binary: sub passes over it and read says what it is.
+UTF-8, is binary: read says what it is, and edit refuses it.
 """

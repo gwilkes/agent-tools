@@ -1,4 +1,5 @@
 .*/
+!/.gci/
 !/.github/
 
 /build/

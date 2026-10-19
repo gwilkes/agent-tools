@@ -60,8 +60,3 @@ class Progress:
                 },
             }
         )
-
-
-def current():
-    """The reporter for this tool call, if its client asked for progress."""
-    return CURRENT.get()

@@ -1,5 +1,6 @@
-"""The sync domain: what of this tree travels to a host, and how a path from
-the wire is checked before anything is written there."""
+"""The sync domain: what of this tree travels to a host, the gzipped tars
+files travel in, and how a path from the wire is checked before anything is
+written there."""
 
 import hashlib
 import io
@@ -9,9 +10,13 @@ import tarfile
 from pathlib import Path
 
 from . import core
+from .core import ToolError
+from .wire import remote_cfg
 
 
-def _translate(pat):
+def _gitignore_regex(pat: str) -> str:
+    """One gitignore pattern as a regex source: `*` and `?` stay within a
+    name, `**/` spans directories."""
     out, i = [], 0
     while i < len(pat):
         if pat.startswith("**/", i):
@@ -48,7 +53,7 @@ class IgnoreRules:
             line = line.rstrip("/")
             anchored = line.startswith("/") or "/" in line
             line = line.lstrip("/")
-            rx = _translate(line)
+            rx = _gitignore_regex(line)
             if not anchored:
                 rx = r"(?:.*/)?" + rx
             self.rules.append((negated, dir_only, re.compile(rx + r"\Z")))
@@ -64,14 +69,14 @@ class IgnoreRules:
         return state
 
 
-def gitignore_lines(directory):
+def gitignore_lines(directory: Path) -> list[str]:
     try:
         return (directory / ".gitignore").read_text().splitlines()
     except OSError:
         return []
 
 
-def ignored_by(layers, rel, is_dir):
+def ignored_by(layers: list, rel: str, is_dir: bool) -> bool:
     """Last match wins, and a deeper .gitignore is consulted after a shallower one."""
     state = False
     for base, rules in layers:
@@ -82,7 +87,7 @@ def ignored_by(layers, rel, is_dir):
     return state
 
 
-def sync_ignore(cfg):
+def sync_ignore(cfg: dict) -> list[str]:
     """The lines read after the root .gitignore. The scratch directory never
     travels, .gitignore or not: its logs are each machine's own, and a host's
     would otherwise be deleted by the next sync. .gci/ is re-included last, so
@@ -91,13 +96,13 @@ def sync_ignore(cfg):
     return [
         ".git/",
         f"/{core.tmp_rel(cfg)}/",
-        *core.remote_cfg(cfg).get("ignore", []),
+        *remote_cfg(cfg).get("ignore", []),
         f"!/{core.CONFIG_DIR}/",
     ]
 
 
-def sync_walk(rules, extra):
-    """The files a sync carries, and every directory walked to find them.
+def sync_walk(rules: core.Rules, extra: list[str]) -> list[str]:
+    """The files a sync carries.
 
     The tree as each .gitignore in it filters it, `extra` lines after the
     root's, without symlinks (a link's target is not the tree's to send) or
@@ -105,7 +110,7 @@ def sync_walk(rules, extra):
     """
     root = core.ROOT
     layers_at = {"": [("", IgnoreRules(gitignore_lines(root) + list(extra)))]}
-    files, dirs = [], []
+    files = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         rel_dir = here.relative_to(root).as_posix()
@@ -115,7 +120,6 @@ def sync_walk(rules, extra):
             dirnames[:] = []
             continue
         if prefix:
-            dirs.append(rel_dir)
             nested = gitignore_lines(here)
             if nested:
                 layers = layers + [(prefix, IgnoreRules(nested))]
@@ -140,10 +144,10 @@ def sync_walk(rules, extra):
             ):
                 continue
             files.append(rel)
-    return files, dirs
+    return files
 
 
-def file_hash(path):
+def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
@@ -151,7 +155,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def safe_parts(rel):
+def safe_parts(rel: object) -> bool:
     """Whether a relative posix path from the wire names only its own subtree."""
     return (
         isinstance(rel, str)
@@ -163,46 +167,84 @@ def safe_parts(rel):
     )
 
 
-def wire_target(rel, base=None):
-    """The path a relative name from the wire means under `base` (ROOT unless
-    given), or None if it could mean anywhere else."""
-    base = base or core.ROOT
+def wire_target(rel: str) -> Path | None:
+    """The path a relative name from the wire means under ROOT, or None if it
+    could mean anywhere else."""
     if not safe_parts(rel):
         return None
-    target = (base / rel).resolve()
-    return target if target.is_relative_to(base) else None
+    target = (core.ROOT / rel).resolve()
+    return target if target.is_relative_to(core.ROOT) else None
 
 
-def pack_sources(sources):
-    """The package's modules ({rel: bytes}) as the gzipped tar /self-update takes."""
+def pack(entries: list[tuple[str, bytes, bool]]) -> bytes:
+    """(rel, bytes, executable) entries as the gzipped tar the wire carries."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for rel, data in sorted(sources.items()):
+        for rel, data, executable in entries:
             info = tarfile.TarInfo(rel)
             info.size = len(data)
+            info.mode = 0o755 if executable else 0o644
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
 
-def unpack_sources(data):
-    """{rel: bytes} from a /self-update body, or ValueError saying what is wrong with it."""
-    sources = {}
+def unpack(data: bytes) -> list[tuple[str, bytes, bool]]:
+    """The (rel, bytes, executable) files of a gzipped tar from the wire,
+    every name checked with safe_parts before any is returned, or a
+    ToolError saying what is wrong with it."""
+    entries = []
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             for member in tar:
                 if not member.isfile():
                     continue
-                if not (safe_parts(member.name) and member.name.endswith(".py")):
-                    raise ValueError(f"not a module path: {member.name}")
-                sources[member.name] = tar.extractfile(member).read()
+                if not safe_parts(member.name):
+                    raise ToolError(f"bad path: {member.name}")
+                entries.append(
+                    (
+                        member.name,
+                        tar.extractfile(member).read(),
+                        bool(member.mode & 0o111),
+                    )
+                )
     except tarfile.TarError as e:
-        raise ValueError(f"bad archive: {e}") from None
-    if "__init__.py" not in sources or "__main__.py" not in sources:
-        raise ValueError("not this package: no __init__.py or __main__.py")
+        raise ToolError(f"bad archive: {e}") from None
+    return entries
+
+
+def pack_files(rels: list[str]) -> bytes:
+    """Tree files, by rel, as a /files body, with whether each is executable."""
+    return pack(
+        [
+            (
+                rel,
+                (core.ROOT / rel).read_bytes(),
+                bool((core.ROOT / rel).stat().st_mode & 0o111),
+            )
+            for rel in rels
+        ]
+    )
+
+
+def pack_sources(sources: dict[str, bytes]) -> bytes:
+    """The package's modules ({rel: bytes}) as the gzipped tar /self-update takes."""
+    return pack([(rel, data, False) for rel, data in sorted(sources.items())])
+
+
+def unpack_sources(data: bytes) -> dict[str, bytes]:
+    """{rel: bytes} from a /self-update body, or a ToolError saying what is wrong with it."""
+    sources = {}
+    for rel, module, _ in unpack(data):
+        if not rel.endswith(".py"):
+            raise ToolError(f"not a module path: {rel}")
+        sources[rel] = module
+    missing = {"__init__.py", "__main__.py"} - set(sources)
+    if missing:
+        raise ToolError(f"not this package: no {' or '.join(sorted(missing))}")
     return sources
 
 
-def prune_empty_parents(path):
+def prune_empty_parents(path: Path) -> None:
     """Remove the directories a deleted file leaves empty, up to the root."""
     parent = path.parent
     while parent != core.ROOT and parent.is_dir() and not any(parent.iterdir()):
